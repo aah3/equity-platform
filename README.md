@@ -7,12 +7,14 @@ A comprehensive platform for analyzing equity factors, optimizing portfolios, an
 - Portfolio Optimization
 - Backtest Results
 - Risk Analysis
+- Earnings Research and Analysis
+- Integration with AI models
 
 ## Setup
 1. Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
-cd YOUR_REPO_NAME
+git clone https://github.com/aah3/equity-platform.git
+cd equity-platform
 ```
 
 2. Create and activate virtual environment
