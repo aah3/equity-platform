@@ -43,3 +43,12 @@ logs/
 
 # data
 data/market_data.db
+src/file_data_manager_v1.py
+src/create_exposures_table.py
+src/create_exposures_table.sql
+src/data_service.py
+src/db_schema.sql
+src/factor_db_example.py
+src/factor_file_etl_v1.py
+src/file_data_manager_v1.py
+src/test_postgres.py
