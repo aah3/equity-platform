@@ -27,3 +27,19 @@ requirements01.txt
 
 # environment
 .venv/
+
+# test files
+app_factors_v0.py
+app_db_integration.py
+app_factors.py
+app_sqlite.py
+app_sqlite_2.py
+
+# plots
+*.png
+
+# logs
+logs/
+
+# data
+data/market_data.db
