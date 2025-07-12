@@ -175,9 +175,6 @@ def run_portfolio_optimization() -> Dict:
                 # st.success(f"optimizer_pure constraints: {optimizer_pure.constraints}")
 
                 # Run optimization (example data not provided)
-                # results = optimizer.optimize(returns, exposures, dates)
-                # results = optimizer.optimize(constraints)
-
                 results = optimizer_pure.optimize(
                     df_ret_wide, 
                     df_exposures, 
@@ -228,8 +225,11 @@ def create_model_input() -> EquityFactorModelInput:
     # Convert string date to date object if needed
     start_date_obj = st.session_state.start_date
     if isinstance(start_date_obj, str):
+        st.success(f"start_date 0 is string: {start_date_obj}")
         start_date_obj = datetime.strptime(start_date_obj, "%Y-%m-%d").date()
-        
+    else:
+        st.success(f"start_date 0 NOT is string, it's {type(start_date_obj)}: {str(start_date_obj)}")
+
     end_date_obj = st.session_state.end_date
     if isinstance(end_date_obj, str):
         end_date_obj = datetime.strptime(end_date_obj, "%Y-%m-%d").date()
@@ -246,7 +246,7 @@ def create_model_input() -> EquityFactorModelInput:
             universe=Universe(st.session_state.universe),
             currency=Currency.USD,
             frequency=Frequency[st.session_state.frequency],
-            start_date=start_date_obj,
+            start_date=pd.to_datetime(str(st.session_state.start_date)).date(), #start_date_obj,
             end_date=end_date_obj,
             concurrent_download=st.session_state.concurrent
         ),
@@ -259,9 +259,11 @@ def create_model_input() -> EquityFactorModelInput:
             base_path="../data/output"
         )
     )
+    
     st.success(f"start_date 0: {model_input.backtest.start_date}")
-    model_input.backtest.start_date = pd.to_datetime('2019-12-31').date()
-    st.success(f"start_date 1: {model_input.backtest.start_date}")
+    # model_input.backtest.start_date = pd.to_datetime('2018-12-31').date()
+    # st.success(f"start_date 1: {model_input.backtest.start_date}")
+    st.success(f"end_date 0: {model_input.backtest.end_date}")
     
     # Set up dates in the model
     set_model_input_dates_turnover(model_input)
@@ -270,7 +272,8 @@ def create_model_input() -> EquityFactorModelInput:
     
     return model_input
 
-def run_data_update_process(model_input: EquityFactorModelInput, update_history: bool = False) -> bool:
+def run_data_update_process(model_input: EquityFactorModelInput, 
+                            update_history: bool = False) -> bool:
     """
     Run the data update process using the ETL functions.
     
@@ -393,7 +396,7 @@ def run_data_update(force_update=False):
             st.error(f"Error updating data: {str(e)}")
   
 # Helper functions
-def improved_correlation_matrix_display(corr_matrix, tab_name):
+def correlation_matrix_display(corr_matrix, tab_name):
     """
     Create an improved correlation matrix visualization with properly formatted values.
     
@@ -468,7 +471,7 @@ def improved_correlation_matrix_display(corr_matrix, tab_name):
     # Use a unique key based on tab name
     st.plotly_chart(fig, use_container_width=True, key=f"corr_matrix_{tab_name}")
 
-def improved_monthly_returns_heatmap(monthly_returns, tab_name):
+def monthly_returns_heatmap(monthly_returns, tab_name):
     """
     Create an improved heatmap of monthly factor returns with values displayed in each cell.
     
@@ -725,10 +728,11 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         # Parse date from string if needed
-        default_start = datetime(2023, 1, 1).date()
+        # default_start = datetime(2019, 12, 31).date()
         start_date = st.date_input(
             "Start Date",
-            value=default_start,
+            # value=default_start,
+            value=datetime(2019, 12, 31).date(),
             key="start_date"
         )
     with col2:
@@ -770,7 +774,7 @@ with st.sidebar:
         num_trades = st.slider(
             "Target Number of Trades", 
             min_value=5, 
-            max_value=100, 
+            max_value=500, 
             value=30,
             key="num_trades"
         )
@@ -974,22 +978,12 @@ with tab2:
                 # Factor correlation matrix
                 # st.subheader("Factor Correlation Matrix")
                 corr_matrix = st.session_state.pure_factor_returns.corr()
-                # fig = px.imshow(
-                #     corr_matrix,
-                #     title="Factor Correlation Matrix",
-                #     color_continuous_scale='YlGn',
-                #     zmin=-1,
-                #     zmax=1
-                # )
-                # # st.plotly_chart(fig, use_container_width=True)
-                # st.plotly_chart(fig, use_container_width=True, key="factors_correlation")
-                
-                improved_correlation_matrix_display(corr_matrix, "pure_factors_correlation")
+                correlation_matrix_display(corr_matrix, "pure_factors_correlation")
 
                 # Monthly factor returns
                 # st.subheader("Monthly Factor Returns")
                 monthly_returns = st.session_state.pure_factor_returns.resample('ME').sum()
-                # improved_monthly_returns_heatmap(monthly_returns, "portfolio_opt")
+                # monthly_returns_heatmap(monthly_returns, "portfolio_opt")
                 fig = px.bar(
                     monthly_returns,
                     title="Monthly Factor Returns",
@@ -1091,21 +1085,12 @@ with tab3:
             # Factor correlation matrix
             # st.subheader("Factor Correlation Matrix")
             corr_matrix = filtered_returns.corr()
-            # fig = px.imshow(
-            #     corr_matrix,
-            #     title="Factor Correlation Matrix",
-            #     color_continuous_scale='RdBu',
-            #     zmin=-1,
-            #     zmax=1
-            # )
-            # # st.plotly_chart(fig, use_container_width=True)
-            # st.plotly_chart(fig, use_container_width=True, key="all_factors_correlation")
-            improved_correlation_matrix_display(corr_matrix, "all_pure_factors_correlation")
+            correlation_matrix_display(corr_matrix, "all_pure_factors_correlation")
             
             # Monthly returns heatmap
             # st.subheader("Monthly Factor Returns")
             monthly_returns = filtered_returns.resample('ME').sum()
-            # improved_monthly_returns_heatmap(monthly_returns, "pure_portfolios")
+            # monthly_returns_heatmap(monthly_returns, "pure_portfolios")
             fig = px.imshow(
                 monthly_returns,
                 title="Monthly Factor Returns Heatmap",

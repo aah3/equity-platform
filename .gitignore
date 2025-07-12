@@ -1,6 +1,7 @@
 # Virtual Environment
 venv/
 env/
+.venv/
 
 # Python
 __pycache__/
@@ -25,13 +26,9 @@ Thumbs.db
 info.txt
 requirements01.txt
 
-# environment
-.venv/
-
 # test files
 app_factors_v0.py
 app_db_integration.py
-app_factors.py
 app_sqlite.py
 app_sqlite_2.py
 
@@ -43,6 +40,8 @@ logs/
 
 # data
 data/market_data.db
+
+# src
 src/file_data_manager_v1.py
 src/create_exposures_table.py
 src/create_exposures_table.sql

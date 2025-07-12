@@ -112,7 +112,8 @@ class DataStore(FilePathHandler):
         # sort & dedupe
         if set(key_cols).issubset(df_combined.columns):
             df_combined.sort_values(list(key_cols), inplace=True)
-            df_combined.drop_duplicates(subset=key_cols, inplace=True)
+            if 'exposure' not in df_combined.columns:
+                df_combined.drop_duplicates(subset=key_cols, inplace=True)
 
         # write back
         self._write_file(df_combined, path)

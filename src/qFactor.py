@@ -448,7 +448,8 @@ class BacktestConfig(BaseModel):
         description="Rebalancing frequency"
     )
     start_date: date = Field(
-        default= pd.Timestamp.now('US/Eastern').date(),
+        # default= pd.Timestamp.now('US/Eastern').date(),
+        default = pd.to_datetime('2018-12-31').date(),
         alias='start',
         description="Backtest start date"
     )
@@ -481,6 +482,10 @@ class BacktestConfig(BaseModel):
         default=None,
         alias='portfolio_list',
         description="Portfolio's securities ids list"
+    )
+    concurrent_download: bool = Field(
+        default=False,
+        description="If True, use asyncio for concurrent downloads from Yahoo Finance."
     )
     # @field_validator('end_date')f
     # def end_date_must_be_after_start_date(cls, v, values):
@@ -901,6 +906,7 @@ class SecurityMasterYahoo(BaseModel):
     weights_data: Optional[pd.DataFrame] = None
     security_master: Optional[pd.DataFrame] = None
     df_portfolio: pd.DataFrame = pd.DataFrame()
+    concurrent_download: Optional[bool] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -992,28 +998,61 @@ class SecurityMasterYahoo(BaseModel):
         Get benchmark constituent weights over time (approximation using Yahoo Finance components).
         Note: Yahoo Finance doesn't directly provide weights; this is an approximation.
         """
+        import asyncio
+        import concurrent.futures
+        import sys
+        import time
+        import pandas as pd
+
+        concurrent_download = getattr(self, 'concurrent_download', False)
         df_weights = pd.DataFrame()
-        for idate in self.dates_turnover:
+
+        def get_components_for_date(idate):
             time.sleep(1)
             components = self._get_ticker_components(self.universe, idate)
             if components.shape[0] > 0:
                 df = components.copy()
-                # df = pd.DataFrame({'sid': components})
-                # df['date'] = idate
                 if 'weight' in components.columns:
                     df['wgt'] = df['weight'].str.replace('%', '').astype(float)
                     if df['wgt'].sum() > 1:
                         df['wgt'] /= df['wgt'].sum()
                 else:
-                    df['wgt'] = 1 / len(components)  # Equal weights as Yahoo Finance doesn't provide actual weights
-                df_weights = pd.concat([df_weights, df])
-        # df_weights = df_weights[['date','sid','wgt']]
+                    df['wgt'] = 1 / len(components)
+                return df
+            return None
+
+        if concurrent_download:
+            async def gather_all():
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    tasks = [loop.run_in_executor(executor, get_components_for_date, idate) for idate in self.dates_turnover]
+                    results = await asyncio.gather(*tasks)
+                return [df for df in results if df is not None]
+
+            if sys.version_info >= (3, 7):
+                try:
+                    results = asyncio.run(gather_all())
+                except RuntimeError:
+                    results = asyncio.get_event_loop().run_until_complete(gather_all())
+            else:
+                loop = asyncio.get_event_loop()
+                results = loop.run_until_complete(gather_all())
+            if results:
+                df_weights = pd.concat(results)
+        else:
+            for idate in self.dates_turnover:
+                df = get_components_for_date(idate)
+                if df is not None:
+                    df_weights = pd.concat([df_weights, df])
+
         if not df_weights.empty:
             if 'sid' not in df_weights.columns:
                 df_weights['sid'] = df_weights['ticker']
             df_weights.index = df_weights['date']
             df_weights.index.name = 'index'
             df_weights.rename(columns={'wgt':'weight','weight':'wgt'}, inplace=True)
+            # TO DO: CHECK DATAFRAME COLUMNS
+            # df_weights.columns = ['date','ticker','name','sector','sub_industry','weight','sid','universe_id']
             df_weights['universe_id'] = UniverseMappingFactory(source='yahoo', universe=self.universe)
             self.weights_data = df_weights
         else:
@@ -1124,35 +1163,315 @@ class SecurityMasterYahoo(BaseModel):
                 print("Portfolio file missing.")
         return self.df_portfolio
     
-    def _get_prices(self, univ_list: List[str]) -> pd.DataFrame: # model_input, 
+    def _get_prices_v0(self, univ_list: List[str]) -> pd.DataFrame: # model_input, 
         """Helper function to get prices from Yahoo Finance."""
+        import asyncio
+        import concurrent.futures
+        import sys
+        import pandas as pd
+        import numpy as np
+        import yfinance as yf
+        import time
+
+        # Determine if async download is requested (backwards compatible)
+        concurrent_download = getattr(self, 'concurrent_download', None)
+        if concurrent_download is None:
+            # Try to get from model_input if available
+            concurrent_download = False
+            if hasattr(self, 'model_input') and hasattr(self.model_input, 'backtest'):
+                concurrent_download = getattr(self.model_input.backtest, 'concurrent_download', False)
+        # If not found, fallback to False
+        if concurrent_download is None:
+            concurrent_download = False
+        if len(univ_list) > 1:
+            # TO DO: Fix why it's not working for multiple tickers... it works for only one at a time
+            concurrent_download = False
+
         price_data = []
-        for ticker in univ_list:
+        start_date = min(self.dates)
+        end_date = max(self.dates)
+
+        def download_one(ticker):
             time.sleep(1)
             try:
-                start_date = min(self.dates)
-                end_date = max(self.dates)
-                df = yf.download(ticker, start=start_date, end=pd.to_datetime(end_date) + pd.Timedelta(days=1))
+                df = yf.download(
+                    ticker, 
+                    start=start_date, 
+                    end=pd.to_datetime(end_date) + pd.Timedelta(days=1)
+                    )
                 if not df.empty:
-                    df = df.xs(ticker, axis=1, level='Ticker')
+                    # Handle both MultiIndex and flat columns
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df = df.xs(ticker, axis=1, level='Ticker')
                     df.index.name = None
                     df.insert(0, 'date', df.index)
-                    df.insert(1, 'sid', ticker) # df['sid'] = ticker
+                    df.insert(1, 'sid', ticker)
                     df.columns = [i.lower() for i in df.columns]
                     df['price'] = df['close']
-                    # df = df[['Close']].reset_index().rename(columns={'Date': 'date', 'Close': 'price'})
-                    price_data.append(df)
+                    return df
             except Exception as e:
                 print(f"Error downloading prices for {ticker}: {e}")
+            return None
+
+        if concurrent_download:
+            # Use asyncio with ThreadPoolExecutor for concurrent downloads
+            async def download_all():
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    tasks = [loop.run_in_executor(executor, download_one, ticker) for ticker in univ_list]
+                    results = await asyncio.gather(*tasks)
+                return [df for df in results if df is not None]
+
+            # Run the async function and get results
+            if sys.version_info >= (3, 7):
+                try:
+                    results = asyncio.run(download_all())
+                except RuntimeError:
+                    # If already in an event loop (e.g., Jupyter), use create_task
+                    results = asyncio.get_event_loop().run_until_complete(download_all())
+            else:
+                loop = asyncio.get_event_loop()
+                results = loop.run_until_complete(download_all())
+            price_data = results
+        else:
+            # Sequential fallback (original logic)
+            for ticker in univ_list:
+                df = download_one(ticker)
+                if df is not None:
+                    price_data.append(df)
 
         if price_data:
             df_price = pd.concat(price_data)
-            df_price['date'] = df_price['date'].dt.date # df_price['date'].dt.strftime('%Y-%m-%d')
+            df_price['date'] = pd.to_datetime(df_price['date']).dt.date
             df_price['return'] = df_price.groupby('sid')['price'].pct_change()
             return df_price
         else:
             return pd.DataFrame()
 
+    def _get_prices(self, univ_list: List[str]) -> pd.DataFrame:
+        """Helper function to get prices from Yahoo Finance."""
+        import asyncio
+        import concurrent.futures
+        import sys
+        import pandas as pd
+        import numpy as np
+        import yfinance as yf
+        import time
+        
+        # Determine if concurrent download is requested (backwards compatible)
+        concurrent_download = getattr(self, 'concurrent_download', None)
+        if concurrent_download is None:
+            # Try to get from model_input if available
+            concurrent_download = False
+            if hasattr(self, 'model_input') and hasattr(self.model_input, 'backtest'):
+                concurrent_download = getattr(self.model_input.backtest, 'concurrent_download', False)
+        
+        # If not found, fallback to False
+        if concurrent_download is None:
+            concurrent_download = False
+        
+        price_data = []
+        start_date = min(self.dates)
+        end_date = max(self.dates)
+        
+        def download_one(ticker, delay=0):
+            """Download data for a single ticker with optional delay for rate limiting."""
+            # Add staggered delay to prevent simultaneous API hits
+            if delay > 0:
+                time.sleep(delay)
+            
+            try:
+                # Add retry logic for failed requests
+                max_retries = 2
+                for attempt in range(max_retries + 1):
+                    try:
+                        df = yf.download(
+                            ticker, 
+                            start=start_date, 
+                            end=pd.to_datetime(end_date) + pd.Timedelta(days=1),
+                            progress=False,  # Disable progress bar for cleaner output
+                            # show_errors=False,  # Suppress yfinance error messages
+                            threads=False  # Disable threading in yfinance to avoid conflicts
+                        )
+                        
+                        if not df.empty:
+                            # Handle both MultiIndex and flat columns
+                            if isinstance(df.columns, pd.MultiIndex):
+                                df = df.xs(ticker, axis=1, level='Ticker')
+                            df.index.name = None
+                            df.insert(0, 'date', df.index)
+                            df.insert(1, 'sid', ticker)
+                            df.columns = [i.lower() for i in df.columns]
+                            df['price'] = df['close']
+                            print(f"✓ Successfully downloaded {ticker}")
+                            return df
+                        else:
+                            print(f"⚠ Empty data returned for {ticker}")
+                            
+                    except Exception as e:
+                        if attempt < max_retries:
+                            print(f"⚠ Retry {attempt + 1}/{max_retries} for {ticker}: {e}")
+                            time.sleep(1)  # Wait before retry
+                        else:
+                            print(f"✗ Failed to download {ticker} after {max_retries + 1} attempts: {e}")
+                            
+            except Exception as e:
+                print(f"✗ Error downloading prices for {ticker}: {e}")
+            return None
+        
+        if concurrent_download:
+            # Use asyncio with ThreadPoolExecutor for concurrent downloads
+            async def download_all():
+                """Refactored download_all function with proper rate limiting and error handling."""
+                try:
+                    # Get the current event loop or create a new one
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    
+                    # Use much more conservative concurrent settings
+                    max_workers = min(3, len(univ_list))  # Reduced from 5 to 3
+                    
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # Create tasks with staggered delays to prevent simultaneous API hits
+                        tasks = []
+                        for i, ticker in enumerate(univ_list):
+                            # Stagger requests with increasing delays
+                            delay = i * 0.3  # 300ms between each request start
+                            task = loop.run_in_executor(executor, download_one, ticker, delay)
+                            tasks.append(task)
+                        
+                        # Wait for all tasks to complete with longer timeout
+                        try:
+                            results = await asyncio.wait_for(
+                                asyncio.gather(*tasks, return_exceptions=True),
+                                timeout=600  # Increased to 10 minutes for larger datasets
+                            )
+                            
+                            # Filter out exceptions and None results with better reporting
+                            valid_results = []
+                            failed_count = 0
+                            for i, result in enumerate(results):
+                                if isinstance(result, Exception):
+                                    print(f"✗ Exception for {univ_list[i]}: {result}")
+                                    failed_count += 1
+                                elif result is not None:
+                                    valid_results.append(result)
+                                else:
+                                    failed_count += 1
+                            
+                            print(f"📊 Download summary: {len(valid_results)} successful, {failed_count} failed")
+                            return valid_results
+                            
+                        except asyncio.TimeoutError:
+                            print("⏱ Download timeout - some requests may not have completed")
+                            # Cancel remaining tasks
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            return []
+                            
+                except Exception as e:
+                    print(f"✗ Error in download_all: {e}")
+                    return []
+            
+            # Properly handle running the async function
+            def run_download_all():
+                """Helper function to run download_all with proper event loop handling."""
+                try:
+                    # Check if we're already in an event loop (like Jupyter notebooks)
+                    try:
+                        loop = asyncio.get_running_loop()
+                        # We're in an existing event loop, need to use different approach
+                        import nest_asyncio
+                        nest_asyncio.apply()
+                        return asyncio.run(download_all())
+                    except RuntimeError:
+                        # No existing event loop, safe to use asyncio.run()
+                        if sys.version_info >= (3, 7):
+                            return asyncio.run(download_all())
+                        else:
+                            # Python < 3.7 fallback
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                return loop.run_until_complete(download_all())
+                            finally:
+                                loop.close()
+                                
+                except ImportError:
+                    # nest_asyncio not available, fallback to thread-based approach
+                    print("nest_asyncio not available, using alternative approach...")
+                    return run_in_thread()
+                except Exception as e:
+                    print(f"Error running async downloads: {e}")
+                    return []
+            
+            def run_in_thread():
+                """Alternative approach using thread for event loop isolation."""
+                import threading
+                import queue
+                
+                result_queue = queue.Queue()
+                
+                def thread_target():
+                    try:
+                        # Create new event loop in thread
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        result = loop.run_until_complete(download_all())
+                        result_queue.put(('success', result))
+                    except Exception as e:
+                        result_queue.put(('error', e))
+                    finally:
+                        loop.close()
+                
+                thread = threading.Thread(target=thread_target)
+                thread.start()
+                thread.join(timeout=320)  # 5+ minute timeout
+                
+                if thread.is_alive():
+                    print("Download thread timeout")
+                    return []
+                
+                try:
+                    status, result = result_queue.get_nowait()
+                    if status == 'success':
+                        return result
+                    else:
+                        print(f"Thread execution error: {result}")
+                        return []
+                except queue.Empty:
+                    print("No result from download thread")
+                    return []
+            
+            # Execute concurrent downloads
+            print(f"🚀 Starting concurrent downloads for {len(univ_list)} tickers...")
+            print("📡 Using rate-limited concurrent requests to respect API limits...")
+            results = run_download_all()
+            price_data = results
+            print(f"✅ Concurrent downloads completed. Got {len(price_data)} successful results.")
+            
+        else:
+            # Sequential fallback (original logic)
+            print(f"Starting sequential downloads for {len(univ_list)} tickers...")
+            for ticker in univ_list:
+                df = download_one(ticker)
+                if df is not None:
+                    price_data.append(df)
+            print(f"Sequential downloads completed. Got {len(price_data)} results.")
+        
+        # Process results (keeping original logic)
+        if price_data:
+            df_price = pd.concat(price_data)
+            df_price['date'] = pd.to_datetime(df_price['date']).dt.date
+            df_price['return'] = df_price.groupby('sid')['price'].pct_change()
+            return df_price
+        else:
+            return pd.DataFrame()
+        
     def get_returns_long(self) -> pd.DataFrame:
         if self.df_price.empty:
             return pd.DataFrame()
@@ -1174,14 +1493,17 @@ def SecurityMasterFactory(model_input, *args) -> BaseModel:
     dates_turnover = [] if model_input.backtest.dates_turnover==None else model_input.backtest.dates_turnover
     dates_daily = [] if model_input.backtest.dates_daily==None else model_input.backtest.dates_daily
     if data_source.lower() == 'yahoo':
-
+        concurrent_download = getattr(model_input.backtest, 'concurrent_download', None)
         security_master = SecurityMasterYahoo(
             universe=get_universe_mapping_yahoo(universe), 
             dates=dates_daily,
             dates_turnover=dates_turnover,
-            )
+            concurrent_download=concurrent_download
+        )
         return security_master
     elif data_source.lower() == 'bloomberg':
+        import bql
+        bq = bql.Service(preferences={'currencyCheck':'when_available'})
         security_master = SecurityMasterBloomberg(
             universe=universe, # 'NDX Index',
             dates=dates_daily, # dates_month
@@ -3205,12 +3527,7 @@ if __name__ == "__main__":
         FileConfig, FileDataManager 
         )
     # test_yahooFactor()
-    # from qFactor import *
-
-    # from src.etl_universe_data import (
-    #     file_load_benchmark_prices, file_load_benchmark_weights, file_load_prices, 
-    #     file_load_returns, file_load_exposures, file_load_factors)
-
+    
     update_history = False
 
     cfg = FileConfig()
@@ -3221,7 +3538,10 @@ if __name__ == "__main__":
             aum=Decimal('100'),
             sigma_regimes=False,
             risk_factors=[
-                RiskFactors.SIZE, RiskFactors.MOMENTUM, RiskFactors.VALUE, RiskFactors.BETA
+                RiskFactors.SIZE, 
+                RiskFactors.MOMENTUM, 
+                RiskFactors.VALUE, 
+                RiskFactors.BETA
                 ],
             bench_weights=None,
             n_buckets=5
@@ -3231,9 +3551,10 @@ if __name__ == "__main__":
             universe=Universe.INDU,  # Universe.INDU: Dow Jones Industrial Average # 'SEMLMCUP Index', 'NDX Index'
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
-            start='2019-12-31', # '2023-12-31',
+            start='2023-12-31', # '2023-12-31',
             # end='2024-12-02' # If not end date, default to today
-            portfolio_list=[]
+            portfolio_list=[],
+            concurrent_download = True
         ),
         regime=RegimeConfig(
             type='vol',

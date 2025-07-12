@@ -54,8 +54,6 @@ def etl_universe_data(model_input):
         # 2.2 Get benchmark members' weights
         df_benchmark_weights = security_master.get_benchmark_weights()
         if df_benchmark_weights.shape[0]==0:
-            # file_members = f"{model_input.backtest.universe.value.replace(' ','_')}_members"
-            # df_existing = file_manager.load_prices(file_members)
             df_existing = mgr.load_prices(identifier+'_members')
             univ_list = sorted(df_existing.sid.unique())
         else:
@@ -130,18 +128,22 @@ if __name__ == "__main__":
             aum=Decimal('100'),
             sigma_regimes=False,
             risk_factors=[
-                RiskFactors.SIZE, RiskFactors.MOMENTUM, RiskFactors.VALUE, RiskFactors.BETA
+                RiskFactors.SIZE, 
+                RiskFactors.MOMENTUM, 
+                RiskFactors.VALUE, 
+                RiskFactors.BETA
                 ],
             bench_weights=None,
             n_buckets=4
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.INDU,
+            universe=Universe.NDX, # INDU,
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
-            start='2019-12-31', # '2022-12-31',
-            portfolio_list=[]
+            start='2017-12-31', # '2022-12-31',
+            portfolio_list=[],
+            concurrent_download = False
         ),
         regime=RegimeConfig(
             type='vol',
@@ -149,7 +151,7 @@ if __name__ == "__main__":
             periods=10
         ),
         export=ExportConfig(
-            update_history=False, # False,
+            update_history=True, # False,
             base_path="./data/time_series",
             s3_config=None
         )
@@ -168,15 +170,15 @@ if __name__ == "__main__":
             print(f"Last updated date in prices: {last_date}")
 
             # Set model_input.backtest.start to last_date (or last_date + 1 day)
-            model_input.backtest.start_date = (last_date + pd.Timedelta(days=-1)).date() # 04/24/2025
+            model_input.backtest.start_date = (last_date + pd.Timedelta(days=-3)).date() # 04/24/2025
         except Exception as e:
             print("No existing data found or error reading file, running full history.")
             model_input.export.update_history = True
 
-    # Get portfolio turnover dates
+    # Set portfolio turnover dates
     set_model_input_dates_turnover(model_input)
 
-    # Get daily business dates
+    # Set daily business dates
     set_model_input_dates_daily(model_input)
 
     # ETL to download and update data
@@ -184,6 +186,8 @@ if __name__ == "__main__":
         confirm = input("You are about to overwrite all historical data files. Are you sure? (y/n): ")
         if confirm.lower() == 'y':
             print("History is going to be updated.")
+        else:
+            model_input.export.update_history = False
     etl_universe_data(model_input)
 
     # Get data from files
