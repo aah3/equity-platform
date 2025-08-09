@@ -1,0 +1,11 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Your rule content
+Use BaseModel from pydantic to generate classes when appropriate
+Use @field_validator instead of @validator decorator
+- You can @ files here
+- You can use markdown but dont have to

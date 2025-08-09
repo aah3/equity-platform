@@ -122,6 +122,8 @@ def etl_universe_data(model_input):
 
 if __name__ == "__main__":
 
+    # Script to run the ETL process and update & save data to file system
+    
     # 1. Create model input
     model_input = EquityFactorModelInput(
         params=ParamsConfig(
