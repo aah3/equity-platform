@@ -123,7 +123,7 @@ def etl_universe_data(model_input):
 if __name__ == "__main__":
 
     # Script to run the ETL process and update & save data to file system
-    
+
     # 1. Create model input
     model_input = EquityFactorModelInput(
         params=ParamsConfig(
@@ -140,7 +140,7 @@ if __name__ == "__main__":
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.NDX, # INDU,
+            universe=Universe.INDU, # INDU, NDX
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
             start='2017-12-31', # '2022-12-31',
@@ -153,7 +153,7 @@ if __name__ == "__main__":
             periods=10
         ),
         export=ExportConfig(
-            update_history=True, # False,
+            update_history=False, # True, False
             base_path="./data/time_series",
             s3_config=None
         )

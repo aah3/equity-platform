@@ -970,7 +970,8 @@ class SecurityMasterYahoo(BaseModel):
                 elif ticker == '^NDX':
                     url_name = "http://en.wikipedia.org/wiki/Nasdaq-100#Components"
                     constituents_df = pd.read_html(url_name)[4]
-                    constituents_df.columns = ['name','ticker','sector','sub_industry']
+                    constituents_df.columns = ['ticker','name','sector','sub_industry']
+                    # constituents_df.columns = ['name','ticker','sector','sub_industry']
                     constituents_df.insert(0,'date',date)
                     return constituents_df
                     # if 'sector' in constituents_df.columns:

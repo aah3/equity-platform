@@ -13,7 +13,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from great_tables import GT
 from functools import partial
-from tqdm import tqdm
+# from tqdm import tqdm
 import logging
 
 logger = logging.getLogger(__name__)
@@ -747,7 +747,8 @@ class RiskTimeSeriesAnalytics(BaseModel):
         """Run analysis in parallel for multiple dates"""
         results = []
         
-        for date in tqdm(dates, desc="Processing dates"):
+        # for date in tqdm(dates, desc="Processing dates"):
+        for date in dates:
             try:
                 result = analysis_func(date=date, **kwargs)
                 results.append(result)
@@ -793,7 +794,8 @@ class RiskTimeSeriesAnalytics(BaseModel):
         if benchmark_weights is not None:
             benchmark_weights.index = benchmark_weights['date']
 
-        for date in tqdm(dates, desc="Analyzing time series"):
+        # for date in tqdm(dates, desc="Analyzing time series"):
+        for date in dates:
             try:
                 date = str(date)# .replace('-','')
                 # Risk decomposition
