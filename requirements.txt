@@ -12,4 +12,5 @@ great-tables>=0.1.0
 boto3>=1.26.0
 lxml>=5.3.2
 sqlalchemy>=2.0.40
-dotenv>=1.1.0
+python-dotenv>=1.0.0
+streamlit>=1.28.0
