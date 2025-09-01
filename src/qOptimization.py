@@ -370,7 +370,7 @@ class TrackingErrorOptimizer(BaseModel):
         
         # Factor constraints
         for factor, constraint in constraints.factor_constraints.items():
-            bench_exposure = benchmark_exposures['wgt'] @ benchmark_exposures[factor]
+            bench_exposure = benchmark_exposures['weight'] @ benchmark_exposures[factor]
             
             if isinstance(constraint, tuple):
                 lower, upper = constraint
@@ -436,11 +436,11 @@ class TrackingErrorOptimizer(BaseModel):
                 self.constraints
             )
             
-            # Solve with appropriate solver
+            # Solve with appropriate solver: print(cp.installed_solvers())
             if self.use_integer_constraints:
-                prob.solve(solver=cp.SCIP, verbose=False)
+                prob.solve(solver=cp.SCIPY, verbose=True)
             else:
-                prob.solve(solver=cp.CLARABEL, verbose=False)
+                prob.solve(solver=cp.CLARABEL, verbose=True)
             
             if prob.status not in ["optimal", "optimal_inaccurate"]:
                 return OptimizationResult(
@@ -471,7 +471,7 @@ class TrackingErrorOptimizer(BaseModel):
             for factor in exposures.columns:
                 if factor not in ['sid', 'date']:
                     opt_exposure = np.array(weights_series) @ exposures[factor]
-                    bench_exposure = benchmark_exposures['wgt'] @ benchmark_exposures[factor]
+                    bench_exposure = benchmark_exposures['weight'] @ benchmark_exposures[factor]
                     factor_exposures[factor] = {
                         'portfolio': float(opt_exposure),
                         'benchmark': float(bench_exposure),
@@ -555,7 +555,8 @@ class TrackingErrorOptimizer(BaseModel):
             start_date = dates[start_idx]
             
             # Get returns for optimization period
-            historical_returns = returns.loc[start_date:date][universe].fillna(0)
+            # historical_returns = returns.loc[start_date:date][universe].fillna(0)
+            historical_returns = returns.loc[pd.Timestamp(start_date).date():pd.Timestamp(date).date()][universe].fillna(0)
             benchmark_rets = benchmark_returns[
                 (benchmark_returns['date'] >= str(start_date)) & 
                 (benchmark_returns['date'] <= str(date))
@@ -618,8 +619,11 @@ class TrackingErrorOptimizer(BaseModel):
                 weights_df.rename(columns={'wgt':'weight_benchmark'}, inplace=True)
                 
                 weights_data = pd.concat([weights_data, weights_df])
-        # import pdb; pdb.set_trace()
+
         weights_data[['weight','weight_benchmark']] = weights_data.groupby('sid')[['weight','weight_benchmark']].ffill()
+        if weights_data['weight_benchmark'].dtype=='O':
+            weights_data['weight_benchmark'] = weights_data['weight_benchmark'].str.rstrip('%').astype(float)/100.
+
         return {
             'meta_data': results_data,
             'weights_data': weights_data
@@ -636,7 +640,8 @@ if __name__=="__main__":
         set_model_input_start, set_model_input_dates_turnover, set_model_input_dates_daily
         )
     import qBacktest as bt
-    from src.etl_universe_data import (file_load_prices, file_load_returns, file_load_exposures)
+
+    from file_data_manager import FileConfig, FileDataManager
 
     model_input = EquityFactorModelInput(
         params=ParamsConfig(
@@ -677,14 +682,26 @@ if __name__=="__main__":
     set_model_input_dates_turnover(model_input)
     set_model_input_dates_daily(model_input)
 
+    cfg = FileConfig()
+    mgr = FileDataManager(cfg)
+    identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
+
     """
     # Get security master object
     """
+    
+    df_benchmark_prices = mgr.load_prices(identifier)
+    df_benchmark_weights = mgr.load_benchmark_weights(identifier)
+    df_prices = mgr.load_prices(identifier+'_members')
+    df_returns = mgr.load_returns(identifier+'_members')
+
     security_master = SecurityMasterFactory(
         model_input=model_input
         )
-    
-    security_master.df_price = file_load_prices(model_input)
+
+    security_master.df_price = df_prices
+    security_master.df_bench = df_benchmark_prices
+    security_master.weights_data = df_benchmark_weights
 
     # get returns wide format
     df_ret_wide = security_master.get_returns_wide()
@@ -693,14 +710,92 @@ if __name__=="__main__":
     df_ret_long = security_master.get_returns_long()
 
     # get exposures long format
-    df_exposures_long = file_load_exposures(model_input)
+    df_exposures_long = mgr.load_exposures(identifier+'_members')
     df_exposures_long['exposure'] = df_exposures_long['exposure'].fillna(0.)
     df_exposures = df_exposures_long.pivot(
-        index=['date','security_id'], 
+        index=['date','sid'], 
         columns='variable', 
         values='exposure').reset_index(drop=False)
-    df_exposures.rename(columns={'security_id':'sid'}, inplace=True)
+    df_exposures['date'] = pd.to_datetime(df_exposures['date'])
 
+    # tracking error optimization
+    """
+    # Run TE optimization
+    """
+    # Create tracking error optimization constraints
+    constraints = TrackingErrorConstraints(
+        long_only=True,
+        full_investment=True,
+        factor_constraints={
+            'beta': (0.0, 0.1),
+            'momentum': (0.0, 0.05),
+            'size': 0.03,
+            'value': 0.01,
+        },
+        weight_bounds=(0.0, 0.1),
+        min_holding=0.01,
+        max_names=20,
+        tracking_error_max=0.05
+    )
+
+    # Initialize optimizer
+    optimizer_te = TrackingErrorOptimizer(
+        constraints=constraints,
+        normalize_weights=True,
+        parallel_processing=False,
+        use_integer_constraints=True
+    )
+        
+    print(optimizer_te)
+
+    # returns=df_ret_wide.copy()
+    benchmark_returns=security_master.df_bench.copy()
+    exposures=df_exposures.copy()
+    benchmark_exposures=security_master.weights_data.copy()
+
+    results_te = optimizer_te.optimize(
+        returns=df_ret_wide, # security_master.get_returns_wide(), # returns
+        benchmark_returns=benchmark_returns,
+        exposures=exposures,
+        benchmark_exposures=benchmark_exposures,
+        dates=model_input.backtest.dates_turnover #dates_to
+    )
+
+    """
+    # Backtest strategy: out-of-sample performance of tracking portfolio
+    """
+    df_weights = results_te['weights_data'].copy()
+    df_weights = df_weights.sort_values(['sid','date'])
+    # df_weights.rename(columns={'weight':'weight','weight_benchmark':'weight_benchmark'}, inplace=True)
+
+    df_weights['n_opt'] = df_weights['weight']!=0
+    print(f"Number of securities in optimal portfolio {df_weights[['date','n_opt']].groupby('date').sum().mean().round(2).squeeze()}")
+
+    print("Optimization Meta Data:")
+    print(results_te['meta_data'].tail(3))
+
+    print("Optimal and Benchmark Weights:")
+    print(results_te['weights_data'].tail(3))
+
+    # TE portfolio: backtest returns
+    config = bt.BacktestConfig(
+        asset_class=bt.AssetClass.EQUITY,
+        portfolio_type=bt.PortfolioType.LONG_ONLY,
+        model_type='tracking_error',
+        annualization_factor=252
+    )
+
+    backtest = bt.Backtest(config=config)
+
+    df_portfolio = results_te['weights_data'].copy()
+    df_portfolio.rename(columns={'sid':'ticker', 'weight':'weight'}, inplace=True)
+    df_returns = df_ret_long.copy()
+    df_returns.rename(columns={'sid':'ticker'}, inplace=True)
+    results_bt = backtest.run_backtest(df_returns, df_portfolio, plot=True)
+    df_ret_opt = backtest.df_pnl.copy()
+
+
+    # factors and pure portfolio optimization
     factor_list = [i.value for i in model_input.params.risk_factors] # ['momentum','beta','size','value']
     print(f"\nFactors in Model: {factor_list}")
 
