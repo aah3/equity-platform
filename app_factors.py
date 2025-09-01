@@ -286,23 +286,146 @@ def run_data_update_process(model_input: EquityFactorModelInput,
     """
     try:
         model_input.export.update_history = update_history
-        st.success(f"Updating data: {'run_data_update_process'}")
+        
+        # Display update type
+        if update_history:
+            st.info("🔄 Starting FULL HISTORY data update - this will overwrite all historical data")
+        else:
+            st.info("🔄 Starting INCREMENTAL data update - appending latest data")
+        
+        st.success(f"Updating data for universe: {model_input.backtest.universe.value}")
+        st.success(f"Date range: {model_input.backtest.start_date} to {model_input.backtest.end_date}")
+        st.success(f"Selected factors: {[f.value for f in model_input.params.risk_factors]}")
 
         with st.spinner("Running data update process..."):
-            # Run main ETL process
-            etl_universe_data(model_input)
+            # Create progress container
+            progress_container = st.container()
             
-            # Sync with cloud storage if enabled
-            if st.session_state.sync_with_cloud:
-                if sync_data_with_s3(model_input):
-                    st.success("Data synced with cloud storage successfully!")
+            with progress_container:
+                st.write("📊 **Step 1:** Initializing ETL process...")
+                
+                # Create a progress bar and status text
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                log_container = st.container()
+                
+                # Progress callback function for Streamlit
+                def streamlit_progress_callback(step, total_steps, message, progress_type="info"):
+                    """Callback function to update Streamlit progress"""
+                    # Update progress bar
+                    progress_percentage = (step / total_steps) * 100
+                    progress_bar.progress(progress_percentage)
+                    
+                    # Update status text
+                    status_text.text(f"Step {step}/{total_steps}: {message}")
+                    
+                    # Display message in log container
+                    with log_container:
+                        if progress_type == "error":
+                            st.error(f"❌ {message}")
+                        elif progress_type == "warning":
+                            st.warning(f"⚠️ {message}")
+                        elif progress_type == "success":
+                            st.success(f"✅ {message}")
+                        else:
+                            st.info(f"📋 {message}")
+                
+                # Run main ETL process with progress updates
+                try:
+                    # Run ETL process with progress callback
+                    etl_universe_data(model_input, progress_callback=streamlit_progress_callback)
+                    
+                    st.success("✅ ETL process completed successfully!")
+                    progress_bar.progress(100)
+                    status_text.text("✅ ETL Complete!")
+                    
+                except Exception as e:
+                    st.error(f"❌ ETL process failed: {str(e)}")
+                    return False
+                
+                st.write("📊 **Step 2:** Data validation and verification...")
+                
+                # Verify data was created/updated
+                cfg = FileConfig()
+                mgr = FileDataManager(cfg)
+                identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
+                
+                try:
+                    # Check if key data files exist and have content
+                    df_prices = mgr.load_prices(identifier+'_members')
+                    df_returns = mgr.load_returns(identifier+'_members')
+                    df_exposures = mgr.load_exposures(identifier+'_members')
+                    
+                    if df_prices is not None and not df_prices.empty:
+                        unique_securities = len(df_prices.sid.unique())
+                        st.success(f"✅ Prices data: {len(df_prices)} records, {unique_securities} securities")
+                    else:
+                        st.warning("⚠️ Prices data appears to be empty")
+                    
+                    if df_returns is not None and not df_returns.empty:
+                        st.success(f"✅ Returns data: {len(df_returns)} records")
+                    else:
+                        st.warning("⚠️ Returns data appears to be empty")
+                    
+                    if df_exposures is not None and not df_exposures.empty:
+                        st.success(f"✅ Exposures data: {len(df_exposures)} records")
+                    else:
+                        st.warning("⚠️ Exposures data appears to be empty")
+                    
+                    # Check factor data
+                    factor_data_status = {}
+                    for factor in model_input.params.risk_factors:
+                        factor_name = factor.value
+                        df_factor = mgr.load_factors(f"{identifier}_members_{factor_name}")
+                        if df_factor is not None and not df_factor.empty:
+                            factor_data_status[factor_name] = f"✅ {len(df_factor)} records"
+                        else:
+                            factor_data_status[factor_name] = "⚠️ Empty or missing"
+                    
+                    st.write("📊 **Factor Data Status:**")
+                    for factor, status in factor_data_status.items():
+                        st.write(f"   • {factor.title()}: {status}")
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ Data verification warning: {str(e)}")
+                
+                st.write("📊 **Step 3:** Cloud storage sync...")
+                
+                # Sync with cloud storage if enabled
+                if st.session_state.sync_with_cloud:
+                    try:
+                        if sync_data_with_s3(model_input):
+                            st.success("✅ Data synced with cloud storage successfully!")
+                        else:
+                            st.warning("⚠️ Failed to sync data with cloud storage")
+                    except Exception as e:
+                        st.warning(f"⚠️ Cloud sync warning: {str(e)}")
                 else:
-                    st.warning("Failed to sync data with cloud storage")
+                    st.info("ℹ️ Cloud storage sync skipped (not enabled)")
+                
+                st.write("📊 **Step 4:** Finalizing update...")
+                
+                # Update session state
+                st.session_state.data_updated = True
+                st.session_state.config_changed = False
+                
+                # Load the updated data into session state
+                try:
+                    if load_existing_data(model_input):
+                        st.success("✅ Data loaded into session state successfully!")
+                    else:
+                        st.warning("⚠️ Data loaded but session state update had issues")
+                except Exception as e:
+                    st.warning(f"⚠️ Session state update warning: {str(e)}")
+                
+                st.success("🎉 **Data update process completed successfully!**")
+                st.balloons()
             
             return True
             
     except Exception as e:
-        st.error(f"Error in data update process: {str(e)}")
+        st.error(f"❌ Error in data update process: {str(e)}")
+        st.error("Please check the logs and try again. If the issue persists, consider updating the full history.")
         return False
 
 def load_existing_data(model_input: EquityFactorModelInput) -> bool:
