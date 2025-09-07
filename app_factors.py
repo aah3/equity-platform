@@ -1,6 +1,4 @@
-# app_factors_test.py
-
-# app_factors.py
+# app_factors_v1.py
 
 import sys
 import streamlit as st
@@ -17,7 +15,7 @@ import json
 from typing import Dict, List, Optional
 
 # Add src directory to path
-sys.path.append('./src')
+sys.path.append('./src/')
 
 import src.qBacktest as bt
 
@@ -121,7 +119,7 @@ def run_factor_analysis() -> Dict:
         st.error(f"Error in factor analysis: {str(e)}")
         return None
 
-def run_portfolio_optimization() -> Dict:
+def run_portfolio_optimization_v1() -> Dict:
     """Run portfolio optimization and return results"""
     try:
         if not st.session_state.data_updated:
@@ -207,10 +205,10 @@ def run_portfolio_optimization() -> Dict:
             # Tracking error optimization
             optimizer = TrackingErrorOptimizer(model_input)
             constraints = TrackingErrorConstraints(
-                max_weight=max_weight,
+                max_weight=max_weight/100.,
                 min_holding=0.001,
                 num_trades=num_trades,
-                tracking_error_max=tracking_error
+                tracking_error_max=tracking_error/100.
             )
             results = optimizer.optimize(constraints)
 
@@ -219,6 +217,711 @@ def run_portfolio_optimization() -> Dict:
     except Exception as e:
         st.error(f"Error in portfolio optimization: {str(e)}")
         return None
+
+def run_tracking_error_optimization() -> Dict:
+    """Run tracking error optimization and return results"""
+    try:
+        if not st.session_state.data_updated:
+            st.warning("Please update data first before running analysis.")
+            return None
+
+        cfg = FileConfig()
+        mgr = FileDataManager(cfg)
+
+        model_input = st.session_state.model_input
+        identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
+        factor_list = [i.value for i in model_input.params.risk_factors]
+
+        # Load required data
+        df_ret_long = mgr.load_returns(identifier+'_members')
+        df_ret_wide = df_ret_long[['date','sid','return']].pivot(
+            index='date', columns='sid', values='return')
+        df_ret_wide.fillna(0., inplace=True)
+
+        # Load exposures
+        df_exposures_long = mgr.load_exposures(identifier+'_members')
+        df_exposures = df_exposures_long[['date','sid','variable','exposure']].pivot(
+            index=['date','sid'], columns='variable', values='exposure').reset_index(drop=False)
+        df_exposures.fillna(0., inplace=True)
+        
+        # Ensure date format consistency - convert to datetime64[ns] to match other dataframes
+        df_exposures['date'] = pd.to_datetime(df_exposures['date'])
+
+        # Load benchmark data
+        df_benchmark_prices = mgr.load_prices(identifier)
+        df_benchmark_weights = mgr.load_benchmark_weights(identifier)
+        
+        # Create security master for benchmark returns
+        # model_input.backtest.dates_turnover = [str(i.date()) for i in model_input.backtest.dates_turnover]
+        security_master = SecurityMasterFactory(model_input=model_input)
+        security_master.df_price = mgr.load_prices(identifier+'_members')
+        security_master.df_bench = df_benchmark_prices
+        security_master.weights_data = df_benchmark_weights
+        
+        # Get benchmark returns
+        benchmark_returns = security_master.df_bench.copy()
+        benchmark_exposures = security_master.weights_data.copy()
+        
+        # Ensure all date columns have consistent datetime64[ns] format
+        if 'date' in benchmark_returns.columns:
+            benchmark_returns['date'] = pd.to_datetime(benchmark_returns['date'])
+        if 'date' in benchmark_exposures.columns:
+            benchmark_exposures['date'] = pd.to_datetime(benchmark_exposures['date'])
+
+        st.warning(f"TE constraints: {st.session_state.te_factor_constraints}")
+
+        # Create tracking error optimization constraints
+        constraints = TrackingErrorConstraints(
+            long_only=st.session_state.te_long_only,
+            full_investment=True,
+            factor_constraints=st.session_state.te_factor_constraints,
+            weight_bounds=(0.0, st.session_state.te_max_weight/100.),
+            min_holding=st.session_state.te_min_holding/100.,
+            max_names=st.session_state.te_max_names,
+            tracking_error_max=st.session_state.te_tracking_error_max/100.
+        )
+
+        # Initialize optimizer
+        optimizer_te = TrackingErrorOptimizer(
+            constraints=constraints,
+            normalize_weights=True,
+            parallel_processing=False,
+            use_integer_constraints=st.session_state.te_use_integer_constraints
+        )
+
+        # Data validation before optimization
+        st.info("Validating data before optimization...")
+        
+        # Check if exposures has required columns
+        required_exposure_cols = ['date', 'sid']
+        missing_exposure_cols = [col for col in required_exposure_cols if col not in df_exposures.columns]
+        if missing_exposure_cols:
+            st.error(f"Missing columns in df_exposures: {missing_exposure_cols}")
+            st.error(f"Available columns: {list(df_exposures.columns)}")
+            return None
+        
+        # Check if benchmark_exposures has required columns
+        required_bench_cols = ['date', 'sid']
+        missing_bench_cols = [col for col in required_bench_cols if col not in benchmark_exposures.columns]
+        if missing_bench_cols:
+            st.error(f"Missing columns in benchmark_exposures: {missing_bench_cols}")
+            st.error(f"Available columns: {list(benchmark_exposures.columns)}")
+            return None
+        
+        # Check if benchmark_returns has required columns
+        if 'return' not in benchmark_returns.columns:
+            st.error(f"Missing 'return' column in benchmark_returns")
+            st.error(f"Available columns: {list(benchmark_returns.columns)}")
+            return None
+        
+        # Check date formats and alignment
+        st.info("Checking date alignment...")
+        
+        # Convert turnover dates to datetime format to match other dataframes
+        st.info("Converting turnover dates to datetime format...")
+        try:
+            # Convert turnover dates to datetime
+            turnover_dates_datetime = [pd.to_datetime(d) for d in model_input.backtest.dates_turnover]
+            st.info(f"Converted turnover dates sample: {turnover_dates_datetime[:3]}")
+            
+            # Update the model_input with converted dates
+            # model_input.backtest.dates_turnover = turnover_dates_datetime
+            st.success("Turnover dates converted to datetime format")
+            
+        except Exception as date_conv_error:
+            st.error(f"Error converting turnover dates: {date_conv_error}")
+            st.error(f"Original turnover dates: {model_input.backtest.dates_turnover[:3]}")
+            return None
+        
+        # Check if dates in exposures match dates_turnover
+        # Handle different date formats properly
+        if not df_exposures.empty:
+            try:
+                # Try to get unique dates safely
+                unique_dates = df_exposures['date'].unique()
+                exposure_dates = set(str(d) for d in unique_dates)
+            except Exception as date_error:
+                st.error(f"Error processing exposure dates: {date_error}")
+                st.error(f"Date column dtype: {df_exposures['date'].dtype}")
+                st.error(f"Sample values: {df_exposures['date'].head(3).tolist()}")
+                return None
+        else:
+            exposure_dates = set()
+            
+        # Now use the converted turnover dates
+        turnover_dates = set(str(d) for d in turnover_dates_datetime)
+        
+        st.info(f"Exposure dates sample: {list(exposure_dates)[:5]}")
+        st.info(f"Turnover dates sample: {list(turnover_dates)[:5]}")
+        
+        # Check for common dates
+        common_dates = exposure_dates.intersection(turnover_dates)
+        st.info(f"Common dates between exposures and turnover: {len(common_dates)}")
+        
+        if len(common_dates) == 0:
+            st.warning("No common dates found between exposures and turnover dates!")
+            st.warning("This might cause the 'sid' KeyError")
+        
+        # Validate date format consistency before optimization
+        st.info("Validating date format consistency...")
+        date_dtypes = {}
+        if not df_exposures.empty and 'date' in df_exposures.columns:
+            date_dtypes['df_exposures'] = str(df_exposures['date'].dtype)
+        if not benchmark_returns.empty and 'date' in benchmark_returns.columns:
+            date_dtypes['benchmark_returns'] = str(benchmark_returns['date'].dtype)
+        if not benchmark_exposures.empty and 'date' in benchmark_exposures.columns:
+            date_dtypes['benchmark_exposures'] = str(benchmark_exposures['date'].dtype)
+        
+        st.info(f"Date column dtypes: {date_dtypes}")
+        
+        # Check if all date dtypes are consistent
+        if len(set(date_dtypes.values())) > 1:
+            st.error("Date column dtypes are inconsistent! This will cause merge errors.")
+            st.error("All date columns should have the same dtype (preferably datetime64[ns])")
+            return None
+        else:
+            st.success("All date columns have consistent dtypes")
+        
+        # Additional debugging: Check first date filtering
+        if model_input.backtest.dates_turnover:
+            first_date = model_input.backtest.dates_turnover[0]
+            st.info(f"Testing first date filtering: {first_date}")
+            # st.info(f"First date type: {type(first_date)}")
+            
+            # Test the filtering logic that's used in the optimization
+            # Since both dates are now datetime objects, we can compare them directly
+            test_exposures = df_exposures[df_exposures['date'] == first_date].copy()
+            st.info(f"Exposures for first date {first_date}: {test_exposures.shape[0]} rows")
+            
+            if test_exposures.empty:
+                st.warning(f"No exposures found for date {first_date}")
+                st.warning("This will cause the 'sid' KeyError in the optimization loop")
+                
+                # Try alternative filtering methods
+                st.info("Trying alternative date filtering methods...")
+                
+                # Method 1: String comparison
+                test_exposures_str = df_exposures[df_exposures['date'].astype(str) == str(first_date)].copy()
+                st.info(f"String comparison result: {test_exposures_str.shape[0]} rows")
+                
+                # Method 2: Date-only comparison
+                test_exposures_date = df_exposures[df_exposures['date'].dt.date == first_date.date()].copy()
+                st.info(f"Date-only comparison result: {test_exposures_date.shape[0]} rows")
+                
+                if test_exposures_date.shape[0] > 0:
+                    st.success("Found exposures using date-only comparison!")
+                    test_exposures = test_exposures_date
+            else:
+                st.success(f"Found exposures for date {first_date}")
+                st.info(f"Sample exposure columns: {list(test_exposures.columns)}")
+                if 'sid' in test_exposures.columns:
+                    st.info(f"Sample sids: {test_exposures['sid'].head().tolist()}")
+        
+        # Run optimization with output capture
+        st.info("Starting optimization... This may take a few minutes.")
+        
+        # Create a container for solver output
+        solver_output_container = st.container()
+        
+        with solver_output_container:
+            st.write("**Solver Output:**")
+            solver_output_placeholder = st.empty()
+        
+        # DEBUG: Add breakpoint here to step into the optimize method
+        # Option 1: Using pdb (standard Python debugger)
+        # import pdb
+        # st.warning("🔍 DEBUG MODE: Breakpoint added at line 456. Check your terminal/console for debugger prompt.")
+        # pdb.set_trace()  # This will pause execution and drop you into the debugger
+        
+        # Option 2: Using ipdb (enhanced debugger - uncomment if you have ipdb installed)
+        # import ipdb
+        # ipdb.set_trace()
+        
+        # Option 3: Using breakpoint() (Python 3.7+)
+        # breakpoint()
+        
+        # Option 4: Debug prints (uncomment to use instead of breakpoint)
+        # st.write("🔍 DEBUG INFO:")
+        # st.write(f"df_ret_wide shape: {df_ret_wide.shape}")
+        # st.write(f"benchmark_returns shape: {benchmark_returns.shape}")
+        # st.write(f"df_exposures shape: {df_exposures.shape}")
+        # st.write(f"benchmark_exposures shape: {benchmark_exposures.shape}")
+        # st.write(f"dates_turnover: {model_input.backtest.dates_turnover[:3]}")
+        # st.write(f"dates_turnover types: {[type(d) for d in model_input.backtest.dates_turnover[:3]]}")
+        
+        # Capture solver output during optimization
+        import io
+        import sys
+        from contextlib import redirect_stdout, redirect_stderr
+        solver_output = io.StringIO()
+
+        try:
+            with redirect_stdout(solver_output), redirect_stderr(solver_output):
+                
+                results_te = optimizer_te.optimize(
+                    returns=df_ret_wide,
+                    benchmark_returns=benchmark_returns,
+                    exposures=df_exposures,
+                    benchmark_exposures=benchmark_exposures,
+                    dates=model_input.backtest.dates_turnover
+                )
+            
+            # Display captured solver output
+            captured_output = solver_output.getvalue()
+            # if captured_output:
+            #     with solver_output_container:
+            #         st.text_area("Solver Output:", value=captured_output, height=300)
+            # else:
+            #     with solver_output_container:
+            #         st.info("No solver output captured")
+                    
+        except Exception as opt_error:
+            # Display any captured output even if optimization fails
+            captured_output = solver_output.getvalue()
+            if captured_output:
+                with solver_output_container:
+                    st.text_area("Solver Output (before error):", value=captured_output, height=300)
+            raise opt_error
+        finally:
+            solver_output.close()
+
+        # Backtest TE portfolio
+        df_weights = results_te['weights_data'].copy()
+        df_weights = df_weights.sort_values(['sid','date'])
+
+        # Calculate number of securities in optimal portfolio
+        df_weights['n_opt'] = df_weights['weight'] != 0
+        avg_securities = df_weights[['date','n_opt']].groupby('date').sum().mean().round(2).squeeze()
+        st.success(f"Average number of securities in optimal portfolio: {avg_securities}")
+
+        # Run backtest
+        config = bt.BacktestConfig(
+            asset_class=bt.AssetClass.EQUITY,
+            portfolio_type=bt.PortfolioType.LONG_ONLY,
+            model_type='tracking_error',
+            annualization_factor=252
+        )
+
+        backtest = bt.Backtest(config=config)
+        df_portfolio = results_te['weights_data'].copy()
+        df_portfolio.rename(columns={'sid':'ticker', 'weight':'weight'}, inplace=True)
+        df_returns = df_ret_long.copy()
+        df_returns.rename(columns={'sid':'ticker'}, inplace=True)
+        results_bt = backtest.run_backtest(df_returns, df_portfolio, plot=False)
+        df_ret_opt = backtest.df_pnl.copy()
+
+        # Store results in session state
+        st.session_state.te_optimization_results = results_te
+        st.session_state.te_backtest_results = results_bt
+        st.session_state.te_portfolio_returns = df_ret_opt
+        st.session_state.te_weights_data = df_weights
+
+        # Display solver output if available
+        st.subheader("Solver Output")
+        solver_outputs = []
+        
+        # Check if we have optimization results with solver output
+        if hasattr(results_te, 'get') and 'weights_data' in results_te:
+            # The solver output would be in the individual optimization results
+            # For now, let's add a placeholder to show where it would appear
+            st.info("Solver output will be displayed here once optimization completes")
+            
+            # Add a button to show solver information
+            if st.button("Show Solver Information"):
+                st.write("**Available Solvers:**")
+                import cvxpy as cp
+                st.write(f"Installed solvers: {cp.installed_solvers()}")
+                st.write(f"Using solver: {'SCIPY' if st.session_state.te_use_integer_constraints else 'CLARABEL'}")
+                st.write(f"Integer constraints: {st.session_state.te_use_integer_constraints}")
+        else:
+            st.info("No solver output available")
+
+        # Store results for unified optimization handling
+        results_unified = {
+            'optimization_type': 'tracking_error',
+            'meta_data': results_te.get('meta_data'),
+            'weights_data': results_te.get('weights_data'),
+            'backtest_results': results_bt,
+            'portfolio_returns': df_ret_opt
+        }
+        st.session_state.optimization_results = results_unified
+
+        st.success("Tracking Error Optimization completed successfully!")
+        return results_unified  # Changed from results_te to results_unified
+    
+    except Exception as e:
+        import traceback
+        
+        # Get detailed error information
+        error_details = {
+            'error_type': type(e).__name__,
+            'error_message': str(e),
+            'traceback': traceback.format_exc()
+        }
+        
+        # Display detailed error information
+        st.error(f"Error in tracking error optimization: {error_details['error_type']}: {error_details['error_message']}")
+        
+        # Show additional debugging information
+        with st.expander("Debug Information", expanded=False):
+            st.write("**Error Details:**")
+            st.code(error_details['traceback'])
+            
+            # Show data shapes and columns if available
+            try:
+                st.write("**Data Information:**")
+                if 'df_ret_wide' in locals():
+                    st.write(f"df_ret_wide shape: {df_ret_wide.shape}")
+                    st.write(f"df_ret_wide columns: {list(df_ret_wide.columns)}")
+                    st.write(f"df_ret_wide index: {df_ret_wide.index.name}")
+                
+                if 'df_exposures' in locals():
+                    st.write(f"df_exposures shape: {df_exposures.shape}")
+                    st.write(f"df_exposures columns: {list(df_exposures.columns)}")
+                    if not df_exposures.empty:
+                        st.write(f"df_exposures sample:")
+                        st.dataframe(df_exposures.head(3))
+                
+                if 'benchmark_returns' in locals():
+                    st.write(f"benchmark_returns shape: {benchmark_returns.shape}")
+                    st.write(f"benchmark_returns columns: {list(benchmark_returns.columns)}")
+                    if not benchmark_returns.empty:
+                        st.write(f"benchmark_returns sample:")
+                        st.dataframe(benchmark_returns.head(3))
+                
+                if 'benchmark_exposures' in locals():
+                    st.write(f"benchmark_exposures shape: {benchmark_exposures.shape}")
+                    st.write(f"benchmark_exposures columns: {list(benchmark_exposures.columns)}")
+                    if not benchmark_exposures.empty:
+                        st.write(f"benchmark_exposures sample:")
+                        st.dataframe(benchmark_exposures.head(3))
+                
+                if 'model_input' in locals():
+                    st.write(f"dates_turnover: {model_input.backtest.dates_turnover}")
+                    st.write(f"dates_turnover type: {type(model_input.backtest.dates_turnover)}")
+                    if model_input.backtest.dates_turnover:
+                        st.write(f"First date: {model_input.backtest.dates_turnover[0]}")
+                        st.write(f"Last date: {model_input.backtest.dates_turnover[-1]}")
+                
+            except Exception as debug_e:
+                st.write(f"Could not retrieve debug information: {debug_e}")
+        
+        return None
+
+# Refactored portfolio optimization functions
+
+def run_portfolio_optimization() -> Dict:
+    """
+    Centralized portfolio optimization function that routes to appropriate 
+    optimization strategy based on the selected objective.
+    
+    Returns:
+        Dict: Optimization results from the selected strategy
+    """
+    try:
+        if not st.session_state.data_updated:
+            st.warning("Please update data first before running analysis.")
+            return None
+
+        if 'model_input' not in st.session_state:
+            st.error("Model input not found. Please run data update first.")
+            return None
+
+        # Get optimization objective from session state
+        optimization_objective = st.session_state.optimization_objective
+        
+        st.info(f"Running {optimization_objective} optimization...")
+        
+        # Route to appropriate optimization strategy
+        if optimization_objective == OptimizationObjective.PURE_FACTOR.value:
+            return run_pure_factor_optimization()
+        elif optimization_objective == OptimizationObjective.TRACKING_ERROR.value:
+            return run_tracking_error_optimization()
+        elif optimization_objective == OptimizationObjective.NUM_TRADES.value:
+            return run_num_trades_optimization()
+        elif optimization_objective == OptimizationObjective.TRANSACTION_COST.value:
+            return run_transaction_cost_optimization()
+        elif optimization_objective == OptimizationObjective.RISK_PARITY.value:
+            return run_risk_parity_optimization()
+        else:
+            st.error(f"Unknown optimization objective: {optimization_objective}")
+            return None
+            
+    except Exception as e:
+        st.error(f"Error in portfolio optimization: {str(e)}")
+        return None
+
+
+def run_pure_factor_optimization() -> Dict:
+    """
+    Run pure factor portfolio optimization for all selected factors.
+    
+    Returns:
+        Dict: Contains pure factor returns and portfolio weights
+    """
+    try:
+        cfg = FileConfig()
+        mgr = FileDataManager(cfg)
+
+        model_input = st.session_state.model_input
+        identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
+        factor_list = [i.value for i in model_input.params.risk_factors]
+
+        # Load required data
+        df_ret_long = mgr.load_returns(identifier+'_members')
+        df_ret_wide = df_ret_long[['date','sid','return']].pivot(
+            index='date', columns='sid', values='return')
+        df_ret_wide.fillna(0., inplace=True)
+
+        # Load exposures
+        df_exposures_long = mgr.load_exposures(identifier+'_members')
+        df_exposures = df_exposures_long[['date','sid','variable','exposure']].pivot(
+            index=['date','sid'], columns='variable', values='exposure').reset_index(drop=False)
+        df_exposures.fillna(0., inplace=True)
+
+        # Initialize containers for results
+        df_pure_return = pd.DataFrame()
+        df_pure_portfolio = pd.DataFrame()
+
+        # Optimize each factor
+        for factor in factor_list:
+            st.success(f"Optimizing Pure Factor: {factor.title()}")
+
+            # Create optimization constraints
+            constraints = PurePortfolioConstraints(
+                long_only=False,
+                full_investment=True,
+                factor_neutral=[i for i in factor_list if i != factor],
+                weight_bounds=(-0.05, 0.05),
+                min_holding=0.01
+            )
+            
+            # Initialize optimizer
+            optimizer_pure = PureFactorOptimizer(
+                target_factor=factor,
+                constraints=constraints,
+                normalize_weights=True,
+                parallel_processing=False
+            )
+
+            # Run optimization
+            results = optimizer_pure.optimize(
+                df_ret_wide, 
+                df_exposures, 
+                model_input.backtest.dates_turnover
+            )
+            df_portfolio = results.get('weights_data')
+            df_pure_portfolio = pd.concat([df_pure_portfolio, df_portfolio])
+
+            # Run backtest for this factor
+            config = bt.BacktestConfig(
+                asset_class=bt.AssetClass.EQUITY,
+                portfolio_type=bt.PortfolioType.LONG_SHORT,
+                model_type=factor,
+                annualization_factor=252
+            )
+
+            backtest = bt.Backtest(config=config)
+            df_portfolio_bt = df_portfolio.copy()
+            df_portfolio_bt.rename(columns={'sid':'ticker', 'weight':'weight'}, inplace=True)
+            df_returns = df_ret_long.copy()
+            df_returns.rename(columns={'sid':'ticker'}, inplace=True)
+            
+            results_bt = backtest.run_backtest(df_returns, df_portfolio_bt, plot=False)
+            df_ret_opt = backtest.df_pnl.copy()
+                
+            df_pure_return = pd.concat([df_pure_return, df_ret_opt])
+
+        # Store results in session state
+        df_pure_return_wide = df_pure_return[['factor','return_opt']].pivot(
+            columns='factor', values='return_opt')
+        
+        st.session_state.pure_factor_returns = df_pure_return_wide
+        st.session_state.df_pure_portfolio = df_pure_portfolio
+        
+        # Prepare results dictionary
+        results = {
+            'optimization_type': 'pure_factor',
+            'pure_factor_returns': df_pure_return_wide,
+            'portfolio_weights': df_pure_portfolio,
+            'factor_list': factor_list
+        }
+        
+        st.session_state.optimization_results = results
+        return results
+        
+    except Exception as e:
+        st.error(f"Error in pure factor optimization: {str(e)}")
+        return None
+
+
+def run_num_trades_optimization() -> Dict:
+    """
+    Run portfolio optimization with number of trades constraint.
+    
+    Returns:
+        Dict: Optimization results for num trades strategy
+    """
+    try:
+        st.info("Number of trades optimization not yet implemented")
+        # Placeholder for future implementation
+        return {
+            'optimization_type': 'num_trades',
+            'status': 'not_implemented'
+        }
+    except Exception as e:
+        st.error(f"Error in num trades optimization: {str(e)}")
+        return None
+
+
+def run_transaction_cost_optimization() -> Dict:
+    """
+    Run portfolio optimization with transaction cost minimization.
+    
+    Returns:
+        Dict: Optimization results for transaction cost strategy
+    """
+    try:
+        st.info("Transaction cost optimization not yet implemented")
+        # Placeholder for future implementation
+        return {
+            'optimization_type': 'transaction_cost',
+            'status': 'not_implemented'
+        }
+    except Exception as e:
+        st.error(f"Error in transaction cost optimization: {str(e)}")
+        return None
+
+
+def run_risk_parity_optimization() -> Dict:
+    """
+    Run risk parity portfolio optimization.
+    
+    Returns:
+        Dict: Optimization results for risk parity strategy
+    """
+    try:
+        st.info("Risk parity optimization not yet implemented")
+        # Placeholder for future implementation
+        return {
+            'optimization_type': 'risk_parity',
+            'status': 'not_implemented'
+        }
+    except Exception as e:
+        st.error(f"Error in risk parity optimization: {str(e)}")
+        return None
+
+
+# Updated Portfolio Optimization Tab section
+def render_portfolio_optimization_tab():
+    """
+    Render the Portfolio Optimization tab with unified optimization handling.
+    """
+    st.header("Portfolio Optimization")
+    
+    # Run optimization button
+    if st.button("Run Portfolio Optimization", type="primary"):
+        results = run_portfolio_optimization()
+    
+    # Display results based on optimization type
+    if st.session_state.optimization_results is not None:
+        results = st.session_state.optimization_results
+        optimization_type = results.get('optimization_type', 'unknown')
+        
+        if optimization_type == 'pure_factor':
+            render_pure_factor_results(results)
+        elif optimization_type == 'tracking_error':
+            render_tracking_error_results(results)
+        elif optimization_type in ['num_trades', 'transaction_cost', 'risk_parity']:
+            st.info(f"{optimization_type.replace('_', ' ').title()} optimization results will be displayed here once implemented.")
+        else:
+            st.warning(f"Unknown optimization type: {optimization_type}")
+
+
+def render_pure_factor_results(results: Dict):
+    """
+    Render pure factor optimization results.
+    
+    Args:
+        results: Dictionary containing pure factor optimization results
+    """
+    pure_factor_returns = results.get('pure_factor_returns')
+    
+    if pure_factor_returns is not None:
+        # Plot cumulative factor returns
+        st.subheader("Pure Factor Returns")
+        fig = px.line(
+            pure_factor_returns.cumsum(),
+            title="Cumulative Pure Factor Returns"
+        )
+        st.plotly_chart(fig, use_container_width=True, key="all_factors_pure")
+        
+        # Factor correlation matrix
+        corr_matrix = pure_factor_returns.corr()
+        correlation_matrix_display(corr_matrix, "pure_factors_correlation")
+
+        # Monthly factor returns
+        monthly_returns = pure_factor_returns.resample('ME').sum()
+        fig = px.bar(
+            monthly_returns,
+            title="Monthly Factor Returns",
+            barmode='group'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Summary statistics
+        st.subheader("Summary Statistics")
+        stats = pd.DataFrame({
+            'Mean': monthly_returns.mean(),
+            'Std': monthly_returns.std(),
+            'Sharpe': monthly_returns.mean() / monthly_returns.std() * np.sqrt(12),
+            'Max': monthly_returns.max(),
+            'Min': monthly_returns.min()
+        })
+        st.dataframe(stats)
+
+
+def render_tracking_error_results(results: Dict):
+    """
+    Render tracking error optimization results.
+    
+    Args:
+        results: Dictionary containing tracking error optimization results
+    """
+    st.subheader("Optimization Results")
+    
+    # Format results for display
+    meta_data = results.get('meta_data')
+    weights_data = results.get('weights_data')
+    
+    if meta_data is not None:
+        st.subheader("Optimization Metrics")
+        st.dataframe(meta_data)
+    
+    if weights_data is not None:
+        st.subheader("Portfolio Weights")
+        # Show the latest portfolio weights
+        latest_date = weights_data['date'].max()
+        latest_weights = weights_data[weights_data['date'] == latest_date]
+        
+        # Convert to display format
+        if 'ticker' not in latest_weights.columns and 'sid' in latest_weights.columns:
+            latest_weights['ticker'] = latest_weights['sid']
+        
+        # Display top holdings
+        top_holdings = latest_weights.sort_values('weight', ascending=False).head(10)
+        st.write(f"Top 10 Holdings (as of {latest_date})")
+        st.dataframe(top_holdings[['ticker', 'weight']].set_index('ticker'))
+        
+        # Plot weights distribution
+        fig = px.bar(
+            top_holdings,
+            x='ticker',
+            y='weight',
+            title="Top Holdings Weights"
+        )
+        fig.update_layout(yaxis_tickformat='.1%')
+        st.plotly_chart(fig, use_container_width=True)
 
 def create_model_input() -> EquityFactorModelInput:
     """Create model input from UI selections"""
@@ -312,23 +1015,44 @@ def run_data_update_process(model_input: EquityFactorModelInput,
                 # Progress callback function for Streamlit
                 def streamlit_progress_callback(step, total_steps, message, progress_type="info"):
                     """Callback function to update Streamlit progress"""
-                    # Update progress bar
-                    progress_percentage = (step / total_steps) * 100
-                    progress_bar.progress(progress_percentage)
-                    
-                    # Update status text
-                    status_text.text(f"Step {step}/{total_steps}: {message}")
-                    
-                    # Display message in log container
-                    with log_container:
-                        if progress_type == "error":
-                            st.error(f"❌ {message}")
-                        elif progress_type == "warning":
-                            st.warning(f"⚠️ {message}")
-                        elif progress_type == "success":
-                            st.success(f"✅ {message}")
+                    try:
+                        # Debug: Log the values being passed
+                        if step > 0 or total_steps != 7:  # Only log when values seem unusual
+                            st.write(f"DEBUG: step={step}, total_steps={total_steps}, message='{message[:50]}...'")
+                        
+                        # Update progress bar - ensure value is between 0.0 and 1.0
+                        if total_steps > 0:
+                            progress_value = step / total_steps
+                            
+                            # Handle case where step might be a percentage (e.g., 14.285714 instead of 1)
+                            if progress_value > 1.0:
+                                # If progress_value > 1, it might be a percentage, convert it
+                                progress_value = progress_value / 100.0
+                            
+                            # Clamp the value to ensure it's within valid range
+                            progress_value = max(0.0, min(1.0, progress_value))
+                            progress_bar.progress(progress_value)
                         else:
-                            st.info(f"📋 {message}")
+                            # Handle edge case where total_steps is 0
+                            progress_bar.progress(0.0)
+                        
+                        # Update status text
+                        status_text.text(f"Step {step}/{total_steps}: {message}")
+                        
+                        # Display message in log container
+                        with log_container:
+                            if progress_type == "error":
+                                st.error(f"❌ {message}")
+                            elif progress_type == "warning":
+                                st.warning(f"⚠️ {message}")
+                            elif progress_type == "success":
+                                st.success(f"✅ {message}")
+                            else:
+                                st.info(f"📋 {message}")
+                    except Exception as progress_error:
+                        # If progress update fails, just log the message without updating progress
+                        st.warning(f"Progress update failed: {progress_error}")
+                        st.info(f"Step {step}/{total_steps}: {message}")
                 
                 # Run main ETL process with progress updates
                 try:
@@ -783,6 +1507,18 @@ if 'config_changed' not in st.session_state:
 if 'concurrent' not in st.session_state:
     st.session_state.concurrent = False
 
+# Initialize TE optimization session state variables
+if 'te_optimization_results' not in st.session_state:
+    st.session_state.te_optimization_results = None
+if 'te_backtest_results' not in st.session_state:
+    st.session_state.te_backtest_results = None
+if 'te_portfolio_returns' not in st.session_state:
+    st.session_state.te_portfolio_returns = None
+if 'te_weights_data' not in st.session_state:
+    st.session_state.te_weights_data = None
+if 'te_factor_constraints' not in st.session_state:
+    st.session_state.te_factor_constraints = {}
+
 # Sidebar for configuration
 with st.sidebar:
     st.header("Configuration")
@@ -893,7 +1629,104 @@ with st.sidebar:
     )
     
     # Dynamic optimization constraints based on objective
-    if optimization_objective != OptimizationObjective.PURE_FACTOR.value:
+    if optimization_objective == OptimizationObjective.TRACKING_ERROR.value:
+        # Tracking Error specific parameters
+        st.subheader("Tracking Error Parameters")
+        
+        te_long_only = st.checkbox(
+            "Long Only Portfolio", 
+            value=True, 
+            key="te_long_only",
+            help="Restrict portfolio to long positions only"
+        )
+        
+        te_max_weight = st.slider(
+            "Max Position Weight (%)", 
+            min_value=1, 
+            max_value=20, 
+            value=10,
+            key="te_max_weight"
+        ) / 100
+        
+        te_min_holding = st.slider(
+            "Min Holding Size (%)", 
+            min_value=0.1, 
+            max_value=5.0, 
+            value=1.0,
+            key="te_min_holding"
+        ) / 100
+        
+        te_max_names = st.slider(
+            "Max Number of Positions", 
+            min_value=5, 
+            max_value=100, 
+            value=20,
+            key="te_max_names"
+        )
+        
+        te_tracking_error_max = st.slider(
+            "Max Tracking Error (%)", 
+            min_value=1, 
+            max_value=20, 
+            value=5,
+            key="te_tracking_error_max"
+        ) / 100
+        
+        te_use_integer_constraints = st.checkbox(
+            "Use Integer Constraints", 
+            value=True, 
+            key="te_use_integer_constraints",
+            help="Use integer constraints for position counting"
+        )
+        
+        # Factor constraints
+        st.subheader("Factor Constraints")
+        # factor_list = [i.value for i in RiskFactors]
+        factor_list = st.session_state.factors  # From the multiselect
+        te_factor_constraints = {}
+        
+        for factor in factor_list:
+            col1, col2 = st.columns(2)
+            with col1:
+                constraint_type = st.selectbox(
+                    f"{factor.title()} Constraint Type",
+                    options=["Range", "Tolerance"],
+                    key=f"te_{factor}_type"
+                )
+            with col2:
+                if constraint_type == "Range":
+                    lower = st.number_input(
+                        f"{factor.title()} Lower Bound",
+                        min_value=-1.0,
+                        max_value=1.0,
+                        value=0.0,
+                        step=0.01,
+                        key=f"te_{factor}_lower"
+                    )
+                    upper = st.number_input(
+                        f"{factor.title()} Upper Bound",
+                        min_value=-1.0,
+                        max_value=1.0,
+                        value=0.1,
+                        step=0.01,
+                        key=f"te_{factor}_upper"
+                    )
+                    te_factor_constraints[factor] = (lower, upper)
+                else:
+                    tolerance = st.number_input(
+                        f"{factor.title()} Tolerance",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=0.03,
+                        step=0.01,
+                        key=f"te_{factor}_tolerance"
+                    )
+                    te_factor_constraints[factor] = tolerance
+        
+        # Store factor constraints in session state
+        st.session_state.te_factor_constraints = te_factor_constraints
+        
+    elif optimization_objective != OptimizationObjective.PURE_FACTOR.value:
         num_trades = st.slider(
             "Target Number of Trades", 
             min_value=5, 
@@ -968,10 +1801,11 @@ elif st.session_state.config_changed:
     run_data_update()
 
 # Main tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Factor Analysis",
     "Portfolio Optimization",
     "Pure Portfolios",
+    "Tracking Error Optimization",
     "Risk Analysis",
     "Documentation"
 ])
@@ -1076,6 +1910,92 @@ with tab1:
             st.dataframe(stats_df.round(3))
 
 # Portfolio Optimization Tab
+# with tab2:
+#     st.header("Portfolio Optimization")
+    
+#     # Run optimization button
+#     if st.button("Run Portfolio Optimization", type="primary"):
+#         results = run_portfolio_optimization()
+    
+#     if st.session_state.optimization_results is not None or st.session_state.pure_factor_returns is not None:
+#         optimization_objective = st.session_state.optimization_objective
+        
+#         if optimization_objective == OptimizationObjective.PURE_FACTOR.value:
+#             # Pure factor optimization results
+#             if st.session_state.pure_factor_returns is not None:
+#                 # Plot cumulative factor returns
+#                 st.subheader("Pure Factor Returns")
+#                 fig = px.line(
+#                     st.session_state.pure_factor_returns.cumsum(),
+#                     title="Cumulative Pure Factor Returns"
+#                 )
+#                 # st.plotly_chart(fig, use_container_width=True)
+#                 st.plotly_chart(fig, use_container_width=True, key="all_factors_pure")
+                
+#                 # Factor correlation matrix
+#                 # st.subheader("Factor Correlation Matrix")
+#                 corr_matrix = st.session_state.pure_factor_returns.corr()
+#                 correlation_matrix_display(corr_matrix, "pure_factors_correlation")
+
+#                 # Monthly factor returns
+#                 # st.subheader("Monthly Factor Returns")
+#                 monthly_returns = st.session_state.pure_factor_returns.resample('ME').sum()
+#                 # monthly_returns_heatmap(monthly_returns, "portfolio_opt")
+#                 fig = px.bar(
+#                     monthly_returns,
+#                     title="Monthly Factor Returns",
+#                     barmode='group'
+#                 )
+#                 st.plotly_chart(fig, use_container_width=True)
+                
+#                 # Summary statistics
+#                 st.subheader("Summary Statistics")
+#                 stats = pd.DataFrame({
+#                     'Mean': monthly_returns.mean(),
+#                     'Std': monthly_returns.std(),
+#                     'Sharpe': monthly_returns.mean() / monthly_returns.std() * np.sqrt(12),
+#                     'Max': monthly_returns.max(),
+#                     'Min': monthly_returns.min()
+#                 })
+#                 st.dataframe(stats)
+#         else:
+#             # Tracking error optimization results
+#             st.subheader("Optimization Results")
+#             if isinstance(st.session_state.optimization_results, dict):
+#                 # Format results for display
+#                 meta_data = st.session_state.optimization_results.get('meta_data')
+#                 weights_data = st.session_state.optimization_results.get('weights_data')
+                
+#                 if meta_data is not None:
+#                     st.subheader("Optimization Metrics")
+#                     st.dataframe(meta_data)
+                
+#                 if weights_data is not None:
+#                     st.subheader("Portfolio Weights")
+#                     # Show the latest portfolio weights
+#                     latest_date = weights_data['date'].max()
+#                     latest_weights = weights_data[weights_data['date'] == latest_date]
+                    
+#                     # Convert to display format
+#                     if 'ticker' not in latest_weights.columns and 'sid' in latest_weights.columns:
+#                         latest_weights['ticker'] = latest_weights['sid']
+                    
+#                     # Display top holdings
+#                     top_holdings = latest_weights.sort_values('weight', ascending=False).head(10)
+#                     st.write(f"Top 10 Holdings (as of {latest_date})")
+#                     st.dataframe(top_holdings[['ticker', 'weight']].set_index('ticker'))
+                    
+#                     # Plot weights distribution
+#                     fig = px.bar(
+#                         top_holdings,
+#                         x='ticker',
+#                         y='weight',
+#                         title="Top Holdings Weights"
+#                     )
+#                     fig.update_layout(yaxis_tickformat='.1%')
+#                     st.plotly_chart(fig, use_container_width=True)
+
+# Portfolio Optimization Tab
 with tab2:
     st.header("Portfolio Optimization")
     
@@ -1083,83 +2003,20 @@ with tab2:
     if st.button("Run Portfolio Optimization", type="primary"):
         results = run_portfolio_optimization()
     
-    if st.session_state.optimization_results is not None or st.session_state.pure_factor_returns is not None:
-        optimization_objective = st.session_state.optimization_objective
+    # Display results based on optimization type
+    if st.session_state.optimization_results is not None:
+        results = st.session_state.optimization_results
+        optimization_type = results.get('optimization_type', 'unknown')
         
-        if optimization_objective == OptimizationObjective.PURE_FACTOR.value:
-            # Pure factor optimization results
-            if st.session_state.pure_factor_returns is not None:
-                # Plot cumulative factor returns
-                st.subheader("Pure Factor Returns")
-                fig = px.line(
-                    st.session_state.pure_factor_returns.cumsum(),
-                    title="Cumulative Pure Factor Returns"
-                )
-                # st.plotly_chart(fig, use_container_width=True)
-                st.plotly_chart(fig, use_container_width=True, key="all_factors_pure")
-                
-                # Factor correlation matrix
-                # st.subheader("Factor Correlation Matrix")
-                corr_matrix = st.session_state.pure_factor_returns.corr()
-                correlation_matrix_display(corr_matrix, "pure_factors_correlation")
-
-                # Monthly factor returns
-                # st.subheader("Monthly Factor Returns")
-                monthly_returns = st.session_state.pure_factor_returns.resample('ME').sum()
-                # monthly_returns_heatmap(monthly_returns, "portfolio_opt")
-                fig = px.bar(
-                    monthly_returns,
-                    title="Monthly Factor Returns",
-                    barmode='group'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Summary statistics
-                st.subheader("Summary Statistics")
-                stats = pd.DataFrame({
-                    'Mean': monthly_returns.mean(),
-                    'Std': monthly_returns.std(),
-                    'Sharpe': monthly_returns.mean() / monthly_returns.std() * np.sqrt(12),
-                    'Max': monthly_returns.max(),
-                    'Min': monthly_returns.min()
-                })
-                st.dataframe(stats)
+        if optimization_type == 'pure_factor':
+            render_pure_factor_results(results)
+        elif optimization_type == 'tracking_error':
+            render_tracking_error_results(results)
+        elif optimization_type in ['num_trades', 'transaction_cost', 'risk_parity']:
+            st.info(f"{optimization_type.replace('_', ' ').title()} optimization results will be displayed here once implemented.")
         else:
-            # Tracking error optimization results
-            st.subheader("Optimization Results")
-            if isinstance(st.session_state.optimization_results, dict):
-                # Format results for display
-                meta_data = st.session_state.optimization_results.get('meta_data')
-                weights_data = st.session_state.optimization_results.get('weights_data')
-                
-                if meta_data is not None:
-                    st.subheader("Optimization Metrics")
-                    st.dataframe(meta_data)
-                
-                if weights_data is not None:
-                    st.subheader("Portfolio Weights")
-                    # Show the latest portfolio weights
-                    latest_date = weights_data['date'].max()
-                    latest_weights = weights_data[weights_data['date'] == latest_date]
-                    
-                    # Convert to display format
-                    if 'ticker' not in latest_weights.columns and 'sid' in latest_weights.columns:
-                        latest_weights['ticker'] = latest_weights['sid']
-                    
-                    # Display top holdings
-                    top_holdings = latest_weights.sort_values('weight', ascending=False).head(10)
-                    st.write(f"Top 10 Holdings (as of {latest_date})")
-                    st.dataframe(top_holdings[['ticker', 'weight']].set_index('ticker'))
-                    
-                    # Plot weights distribution
-                    fig = px.bar(
-                        top_holdings,
-                        x='ticker',
-                        y='weight',
-                        title="Top Holdings Weights"
-                    )
-                    fig.update_layout(yaxis_tickformat='.1%')
-                    st.plotly_chart(fig, use_container_width=True)
+            st.warning(f"Unknown optimization type: {optimization_type}")
+
 
 # Pure Portfolios Tab
 with tab3:
@@ -1399,8 +2256,277 @@ with tab3:
     else:
         st.info("Please run portfolio optimization first to view pure factor portfolios.")
 
-# Risk Analysis Tab
+# Tracking Error Optimization Tab
 with tab4:
+    st.header("Tracking Error Optimization")
+    
+    # Run TE optimization button
+    if st.button("Run Tracking Error Optimization", type="primary", key="te_optimization_btn"):
+        results = run_tracking_error_optimization()
+    
+    if st.session_state.te_optimization_results is not None:
+        # Display optimization results
+        st.subheader("Optimization Results")
+        
+        # Meta data summary
+        meta_data = st.session_state.te_optimization_results.get('meta_data')
+        weights_data = st.session_state.te_optimization_results.get('weights_data')
+        
+        if meta_data is not None and not meta_data.empty:
+            # Summary statistics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                avg_te = meta_data['tracking_error'].mean()
+                st.metric("Average Tracking Error", f"{avg_te:.2%}")
+            
+            with col2:
+                avg_opt_time = meta_data['optimization_time'].mean()
+                st.metric("Avg Optimization Time", f"{avg_opt_time:.2f}s")
+            
+            with col3:
+                success_rate = (meta_data['status'] == 'success').mean()
+                st.metric("Success Rate", f"{success_rate:.1%}")
+            
+            with col4:
+                avg_obj_value = meta_data['objective_value'].mean()
+                st.metric("Avg Objective Value", f"{avg_obj_value:.4f}")
+            
+            # Optimization metrics over time
+            st.subheader("Optimization Metrics Over Time")
+            
+            # Plot tracking error over time
+            fig = px.line(
+                meta_data.set_index('date')['tracking_error'],
+                title="Tracking Error Over Time",
+                labels={'value': 'Tracking Error', 'date': 'Date'}
+            )
+            fig.update_layout(yaxis_tickformat='.1%')
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Plot optimization time over time
+            fig = px.bar(
+                meta_data,
+                x='date',
+                y='optimization_time',
+                title="Optimization Time by Date"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Factor exposures over time
+            st.subheader("Factor Exposures Over Time")
+            
+            # Get factor exposure columns
+            factor_cols = [col for col in meta_data.columns if col.startswith(('beta_', 'momentum_', 'size_', 'value_'))]
+            if factor_cols:
+                # Create factor exposure plots
+                for factor in ['beta', 'momentum', 'size', 'value']:
+                    factor_cols_subset = [col for col in factor_cols if col.startswith(factor)]
+                    if factor_cols_subset:
+                        fig = go.Figure()
+                        
+                        for col in factor_cols_subset:
+                            exposure_type = col.split('_')[-1]
+                            fig.add_trace(go.Scatter(
+                                x=meta_data['date'],
+                                y=meta_data[col],
+                                mode='lines+markers',
+                                name=f"{factor.title()} - {exposure_type.title()}",
+                                line=dict(width=2)
+                            ))
+                        
+                        fig.update_layout(
+                            title=f"{factor.title()} Factor Exposures Over Time",
+                            xaxis_title="Date",
+                            yaxis_title="Exposure",
+                            yaxis_tickformat='.1%'
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+        
+        # Portfolio weights analysis
+        if weights_data is not None and not weights_data.empty:
+            st.subheader("Portfolio Weights Analysis")
+            
+            # Latest portfolio holdings
+            latest_date = weights_data['date'].max()
+            latest_weights = weights_data[weights_data['date'] == latest_date].copy()
+            
+            # Filter out zero weights
+            latest_weights = latest_weights[latest_weights['weight'] > 0].sort_values('weight', ascending=False)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**Latest Portfolio Holdings (as of {latest_date})**")
+                
+                # Display top holdings
+                top_holdings = latest_weights.head(15)
+                if 'ticker' not in top_holdings.columns:
+                    top_holdings['ticker'] = top_holdings['sid']
+                
+                # Format weights as percentages
+                display_weights = top_holdings[['ticker', 'weight']].copy()
+                display_weights['weight'] = display_weights['weight'].apply(lambda x: f"{x:.2%}")
+                display_weights = display_weights.set_index('ticker')
+                
+                st.dataframe(display_weights, use_container_width=True)
+            
+            with col2:
+                # Portfolio concentration
+                st.write("**Portfolio Concentration**")
+                
+                # Calculate concentration metrics
+                total_weight = latest_weights['weight'].sum()
+                top_5_weight = latest_weights.head(5)['weight'].sum()
+                top_10_weight = latest_weights.head(10)['weight'].sum()
+                herfindahl = (latest_weights['weight'] ** 2).sum()
+                
+                concentration_metrics = pd.DataFrame({
+                    'Metric': ['Top 5 Holdings', 'Top 10 Holdings', 'Herfindahl Index', 'Total Weight'],
+                    'Value': [
+                        f"{top_5_weight:.1%}",
+                        f"{top_10_weight:.1%}",
+                        f"{herfindahl:.3f}",
+                        f"{total_weight:.1%}"
+                    ]
+                })
+                st.dataframe(concentration_metrics.set_index('Metric'), use_container_width=True)
+            
+            # Portfolio weights distribution
+            st.subheader("Portfolio Weights Distribution")
+            
+            # Plot weights distribution
+            fig = px.histogram(
+                latest_weights,
+                x='weight',
+                nbins=20,
+                title="Distribution of Portfolio Weights",
+                labels={'weight': 'Weight', 'count': 'Number of Holdings'}
+            )
+            fig.update_layout(xaxis_tickformat='.1%')
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Top holdings bar chart
+            fig = px.bar(
+                latest_weights.head(20),
+                x='ticker' if 'ticker' in latest_weights.columns else 'sid',
+                y='weight',
+                title="Top 20 Holdings by Weight"
+            )
+            fig.update_layout(yaxis_tickformat='.1%')
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Backtest results
+        if st.session_state.te_backtest_results is not None:
+            st.subheader("Backtest Performance")
+            
+            bt_results = st.session_state.te_backtest_results
+            
+            # Performance metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Cumulative Return", f"{bt_results.cumulative_return_benchmark:.2%}")
+            
+            with col2:
+                st.metric("Sharpe Ratio", f"{bt_results.sharpe_ratio_benchmark:.2f}")
+            
+            # with col3:
+            #     st.metric("Max Drawdown", f"{bt_results.max_drawdown_benchmark:.2%}")
+            
+            # with col4:
+            #     st.metric("Volatility", f"{bt_results.volatility_benchmark:.2%}")
+            
+            # Performance comparison plot
+            if st.session_state.te_portfolio_returns is not None:
+                st.subheader("Portfolio vs Benchmark Performance")
+                
+                # Create performance comparison
+                df_perf = st.session_state.te_portfolio_returns.copy()
+                
+                # Plot cumulative returns
+                fig = px.line(
+                    df_perf[['return_opt', 'return_benchmark']].cumsum(),
+                    title="Cumulative Returns: Portfolio vs Benchmark",
+                    labels={'value': 'Cumulative Return', 'index': 'Date'}
+                )
+                fig.update_layout(yaxis_tickformat='.1%')
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Rolling tracking error
+                window = 22  # 1 month
+                rolling_te = df_perf['return_opt'].rolling(window=window).std() - df_perf['return_benchmark'].rolling(window=window).std()
+                
+                fig = px.line(
+                    rolling_te,
+                    title="Rolling Tracking Error (1 Month)",
+                    labels={'value': 'Tracking Error', 'index': 'Date'}
+                )
+                fig.update_layout(yaxis_tickformat='.1%')
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Portfolio turnover analysis
+        if weights_data is not None and not weights_data.empty:
+            st.subheader("Portfolio Turnover Analysis")
+            
+            # Calculate turnover between rebalance dates
+            turnover_dates = sorted(weights_data['date'].unique())
+            turnover_series = []
+            
+            for i in range(1, len(turnover_dates)):
+                prev_date = turnover_dates[i-1]
+                curr_date = turnover_dates[i]
+                
+                prev_weights = weights_data[weights_data['date'] == prev_date].set_index('sid')['weight']
+                curr_weights = weights_data[weights_data['date'] == curr_date].set_index('sid')['weight']
+                
+                # Align indices
+                common_sids = prev_weights.index.intersection(curr_weights.index)
+                prev_weights = prev_weights.reindex(common_sids).fillna(0)
+                curr_weights = curr_weights.reindex(common_sids).fillna(0)
+                
+                # Calculate one-way turnover
+                turnover = abs(curr_weights - prev_weights).sum() / 2
+                turnover_series.append({
+                    'date': curr_date,
+                    'turnover': turnover
+                })
+            
+            if turnover_series:
+                turnover_df = pd.DataFrame(turnover_series)
+                
+                # Plot turnover
+                fig = px.bar(
+                    turnover_df,
+                    x='date',
+                    y='turnover',
+                    title="Portfolio Turnover by Rebalance Date"
+                )
+                fig.update_layout(yaxis_tickformat='.1%')
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Turnover statistics
+                turnover_stats = pd.DataFrame({
+                    'Metric': [
+                        'Average Turnover',
+                        'Max Turnover',
+                        'Min Turnover',
+                        'Turnover Std Dev'
+                    ],
+                    'Value': [
+                        f"{turnover_df['turnover'].mean():.1%}",
+                        f"{turnover_df['turnover'].max():.1%}",
+                        f"{turnover_df['turnover'].min():.1%}",
+                        f"{turnover_df['turnover'].std():.1%}"
+                    ]
+                })
+                st.dataframe(turnover_stats.set_index('Metric'), use_container_width=True)
+    
+    else:
+        st.info("Please run tracking error optimization to view results. Make sure to select 'tracking_error' as the optimization objective in the sidebar.")
+
+# Risk Analysis Tab
+with tab5:
     st.header("Risk Analysis")
     
     if st.session_state.factor_data is not None:
@@ -1497,7 +2623,7 @@ with tab4:
         st.info("Please run factor analysis first to view risk analysis.")
 
 # Documentation Tab
-with tab5:
+with tab6:
     st.header("Documentation")
     
     st.markdown("""
@@ -1532,6 +2658,20 @@ with tab5:
        - Optimizes portfolios with tracking error constraints
        - Controls number of trades
        - Manages position weights
+
+    ### Tracking Error Optimization
+    
+    The Tracking Error Optimization tab provides comprehensive tools for:
+    - **Portfolio Optimization**: Minimize tracking error while respecting factor constraints
+    - **Performance Analysis**: Compare optimized portfolio vs benchmark performance
+    - **Risk Management**: Monitor factor exposures and portfolio concentration
+    - **Turnover Analysis**: Track portfolio turnover and rebalancing costs
+    
+    Key features:
+    - Configurable factor constraints (range or tolerance-based)
+    - Position limits and concentration controls
+    - Integer constraints for realistic position counting
+    - Real-time optimization metrics and performance tracking
     
     ### Pure Factor Portfolios
     
@@ -1611,6 +2751,7 @@ with tab5:
         
         #### Optimization
         - `run_portfolio_optimization`: Runs optimization based on selected objective
+        - `run_tracking_error_optimization`: Runs tracking error optimization with comprehensive analysis
         - `PureFactorOptimizer`: Creates pure factor portfolios
         - `TrackingErrorOptimizer`: Optimizes with tracking error constraints
         

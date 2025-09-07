@@ -42,6 +42,11 @@ logs/
 data/market_data.db
 
 # src
+app_factors_v1.py
+app_factors_v2.py
+src/analyzers_and_reports.py
+src/concrete_optimizers.py
+src/factor_framework_architecture.py
 src/file_data_manager_v1.py
 src/create_exposures_table.py
 src/create_exposures_table.sql

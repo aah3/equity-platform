@@ -205,7 +205,6 @@ class Backtest(BaseModel):
 
         # Aggregate returns by date
         df_pnl = df_processed[['date', 'return_benchmark', 'return_opt']].groupby(['date']).sum()
-        # import pdb; pdb.set_trace()
         self.df_pnl = df_pnl.copy()
         self.df_pnl.insert(0, 'factor', self.config.model_type)
 

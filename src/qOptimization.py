@@ -50,6 +50,7 @@ class OptimizationResult(BaseModel):
     error_message: Optional[str] = None
     factor_exposures_active: Optional[Dict[str, dict]] = None
     tracking_error: Optional[float] = None
+    solver_output: Optional[str] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -437,10 +438,27 @@ class TrackingErrorOptimizer(BaseModel):
             )
             
             # Solve with appropriate solver: print(cp.installed_solvers())
-            if self.use_integer_constraints:
-                prob.solve(solver=cp.SCIPY, verbose=True)
-            else:
-                prob.solve(solver=cp.CLARABEL, verbose=True)
+            import io
+            import sys
+            from contextlib import redirect_stdout, redirect_stderr
+            
+            # Capture solver output
+            solver_output = io.StringIO()
+            try:
+                with redirect_stdout(solver_output), redirect_stderr(solver_output):
+                    if self.use_integer_constraints:
+                        prob.solve(solver=cp.SCIPY, verbose=True)
+                    else:
+                        prob.solve(solver=cp.CLARABEL, verbose=True)
+                
+                solver_log = solver_output.getvalue()
+                if solver_log:
+                    logger.info(f"Solver output for date {date}:\n{solver_log}")
+            except Exception as solver_error:
+                solver_log = f"Solver error: {str(solver_error)}"
+                logger.error(solver_log)
+            finally:
+                solver_output.close()
             
             if prob.status not in ["optimal", "optimal_inaccurate"]:
                 return OptimizationResult(
@@ -542,12 +560,16 @@ class TrackingErrorOptimizer(BaseModel):
         benchmark_returns['date'] = pd.to_datetime(benchmark_returns['date'])
         # import pdb; pdb.set_trace()
         for date in dates:
-            # print(f"date is {date}")
+            print(f"date is {date}")
             # Get universe and exposures for current date
             current_exposures = exposures[
                 exposures['date'] == str(date)#.replace('-','')
             ].copy()
+            if 'sid' not in current_exposures.columns:
+                print(f"sid not in current_exposures columns {date}")
+                continue
             universe = current_exposures['sid'].tolist()
+            print(f"universe is {universe}")
             
             # Get historical returns
             date_idx = dates.index(date)
@@ -624,6 +646,12 @@ class TrackingErrorOptimizer(BaseModel):
         if weights_data['weight_benchmark'].dtype=='O':
             weights_data['weight_benchmark'] = weights_data['weight_benchmark'].str.rstrip('%').astype(float)/100.
 
+        # Identify numeric columns
+        numeric_cols = results_data.select_dtypes(include=np.number).columns
+
+        # Round only the numeric columns to 3 decimal places
+        results_data[numeric_cols] = results_data[numeric_cols].round(3)
+
         return {
             'meta_data': results_data,
             'weights_data': weights_data
@@ -658,7 +686,7 @@ if __name__=="__main__":
             universe=Universe.INDU,
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
-            start='2022-12-31',
+            start='2018-12-31',
             portfolio_list=[]
         ),
         regime=RegimeConfig(
@@ -689,7 +717,6 @@ if __name__=="__main__":
     """
     # Get security master object
     """
-    
     df_benchmark_prices = mgr.load_prices(identifier)
     df_benchmark_weights = mgr.load_benchmark_weights(identifier)
     df_prices = mgr.load_prices(identifier+'_members')
@@ -718,9 +745,8 @@ if __name__=="__main__":
         values='exposure').reset_index(drop=False)
     df_exposures['date'] = pd.to_datetime(df_exposures['date'])
 
-    # tracking error optimization
     """
-    # Run TE optimization
+    # Run Tracking Error (TE) optimization
     """
     # Create tracking error optimization constraints
     constraints = TrackingErrorConstraints(
@@ -750,20 +776,18 @@ if __name__=="__main__":
 
     # returns=df_ret_wide.copy()
     benchmark_returns=security_master.df_bench.copy()
-    exposures=df_exposures.copy()
+    # exposures=df_exposures.copy()
     benchmark_exposures=security_master.weights_data.copy()
 
     results_te = optimizer_te.optimize(
         returns=df_ret_wide, # security_master.get_returns_wide(), # returns
         benchmark_returns=benchmark_returns,
-        exposures=exposures,
+        exposures=df_exposures, # exposures,
         benchmark_exposures=benchmark_exposures,
         dates=model_input.backtest.dates_turnover #dates_to
     )
 
-    """
-    # Backtest strategy: out-of-sample performance of tracking portfolio
-    """
+    # Backtest TE portfolio: out-of-sample performance
     df_weights = results_te['weights_data'].copy()
     df_weights = df_weights.sort_values(['sid','date'])
     # df_weights.rename(columns={'weight':'weight','weight_benchmark':'weight_benchmark'}, inplace=True)
@@ -794,7 +818,9 @@ if __name__=="__main__":
     results_bt = backtest.run_backtest(df_returns, df_portfolio, plot=True)
     df_ret_opt = backtest.df_pnl.copy()
 
-
+    """
+    # Optimal Pure Factor Portfolios 
+    """
     # factors and pure portfolio optimization
     factor_list = [i.value for i in model_input.params.risk_factors] # ['momentum','beta','size','value']
     print(f"\nFactors in Model: {factor_list}")
@@ -822,7 +848,6 @@ if __name__=="__main__":
         )
 
         # Run optimization (example data not provided)
-        # results = optimizer.optimize(returns, exposures, dates)
         results_opt = optimizer_pure.optimize(
             returns = df_ret_wide, 
             exposures = df_exposures, 
@@ -845,8 +870,6 @@ if __name__=="__main__":
         df_ret_opt = backtest.df_pnl.copy()
 
         print(f"{factor.upper()} Factor Return & Sharpe : {results_bt.cumulative_return_benchmark:.2%}, {results_bt.sharpe_ratio_benchmark:.2f}")
-        # df_ret_opt = get_backtest(df_ret_long, df_portfolio, lag=1, flag_plot=False)
-        # df_ret_opt.insert(0, 'factor', factor.lower())
             
         df_pure_return = pd.concat([df_pure_return, df_ret_opt])
         df_pure_portfolio = pd.concat([df_pure_portfolio, df_portfolio])
