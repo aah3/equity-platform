@@ -1,4 +1,4 @@
-# app_factors_v1.py
+# app_factors.py
 
 import sys
 import streamlit as st
@@ -923,6 +923,7 @@ def render_tracking_error_results(results: Dict):
         fig.update_layout(yaxis_tickformat='.1%')
         st.plotly_chart(fig, use_container_width=True)
 
+
 def create_model_input() -> EquityFactorModelInput:
     """Create model input from UI selections"""
     # Convert string date to date object if needed
@@ -974,6 +975,7 @@ def create_model_input() -> EquityFactorModelInput:
     # st.success(f"dates_turnover: {model_input.backtest.dates_turnover}")
     
     return model_input
+
 
 def run_data_update_process(model_input: EquityFactorModelInput, 
                             update_history: bool = False) -> bool:
@@ -1152,6 +1154,7 @@ def run_data_update_process(model_input: EquityFactorModelInput,
         st.error("Please check the logs and try again. If the issue persists, consider updating the full history.")
         return False
 
+
 def load_existing_data(model_input: EquityFactorModelInput) -> bool:
     """
     Load existing data from files using FileDataManager.
@@ -1199,6 +1202,7 @@ def load_existing_data(model_input: EquityFactorModelInput) -> bool:
         st.error(f"Error loading data: {str(e)}")
         return False
 
+
 def run_data_update(force_update=False):
     """Run data update process"""
     # Check if configuration has changed
@@ -1242,6 +1246,7 @@ def run_data_update(force_update=False):
         except Exception as e:
             st.error(f"Error updating data: {str(e)}")
   
+
 # Helper functions
 def correlation_matrix_display(corr_matrix, tab_name):
     """
@@ -1318,6 +1323,7 @@ def correlation_matrix_display(corr_matrix, tab_name):
     # Use a unique key based on tab name
     st.plotly_chart(fig, use_container_width=True, key=f"corr_matrix_{tab_name}")
 
+
 def monthly_returns_heatmap(monthly_returns, tab_name):
     """
     Create an improved heatmap of monthly factor returns with values displayed in each cell.
@@ -1393,6 +1399,7 @@ def monthly_returns_heatmap(monthly_returns, tab_name):
     # Use a unique key based on tab name
     st.plotly_chart(fig, use_container_width=True, key=f"monthly_heatmap_{tab_name}")
 
+
 # Initialize AWS S3 client
 def init_s3_client():
     """Initialize S3 client with credentials from environment variables"""
@@ -1408,6 +1415,7 @@ def init_s3_client():
         st.error(f"Error initializing S3 client: {str(e)}")
         return None
 
+
 def upload_to_s3(file_path: str, s3_key: str) -> bool:
     """Upload a file to S3"""
     try:
@@ -1418,6 +1426,7 @@ def upload_to_s3(file_path: str, s3_key: str) -> bool:
     except Exception as e:
         st.error(f"Error uploading to S3: {str(e)}")
     return False
+
 
 def download_from_s3(s3_key: str, local_path: str) -> bool:
     """Download a file from S3"""
@@ -1436,6 +1445,7 @@ def download_from_s3(s3_key: str, local_path: str) -> bool:
     except Exception as e:
         st.error(f"Error downloading from S3: {str(e)}")
     return False
+
 
 def sync_data_with_s3(model_input: EquityFactorModelInput) -> bool:
     """Sync data between local storage and S3"""
@@ -1471,6 +1481,7 @@ def sync_data_with_s3(model_input: EquityFactorModelInput) -> bool:
         st.error(f"Error syncing data with S3: {str(e)}")
         return False
 
+
 # Set page config
 st.set_page_config(
     page_title="Equity Factor Analysis Platform",
@@ -1479,11 +1490,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+
 # App title and description
 st.title("Equity Factor Analysis Platform")
 st.markdown("""
 This platform provides tools for equity factor analysis, portfolio optimization, and risk management.
 """)
+
 
 # Initialize session state variables if they don't exist
 if 'model_input' not in st.session_state:
@@ -1787,6 +1800,7 @@ def check_config_changes():
     }
     
     return current_config != stored_config
+
 
 # Run data update or load existing data based on mode
 if st.session_state.data_mode == "Update Data" and update_data:

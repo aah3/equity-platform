@@ -427,7 +427,9 @@ class TrackingErrorOptimizer(BaseModel):
         """Optimize portfolio for a single period"""
         try:
             start_time = pd.Timestamp.now()
-            
+            if ('weight' not in benchmark_exposures) & ('weight_benchmark' in benchmark_exposures):
+                benchmark_exposures['weight'] = benchmark_exposures['weight_benchmark']
+
             # Set up and solve optimization problem
             prob, w, wi = self._setup_optimization_problem(
                 returns, 
@@ -594,7 +596,7 @@ class TrackingErrorOptimizer(BaseModel):
             current_bench_exposures['date'] = pd.to_datetime(current_bench_exposures['date'])
             current_bench_exposures = current_bench_exposures.merge(current_exposures, how='left', on=['date','sid'])
             current_bench_exposures.fillna(0., inplace=True)
-            
+
             result = self._optimize_single_period(
                 str(date),
                 historical_returns,
@@ -637,8 +639,12 @@ class TrackingErrorOptimizer(BaseModel):
 
                 # Include benchmark weights
                 weights_df['date'] = pd.to_datetime(weights_df['date'])
-                weights_df = weights_df.merge(benchmark_exposures[['date','sid','wgt']], how='left', on=['date','sid'])
-                weights_df.rename(columns={'wgt':'weight_benchmark'}, inplace=True)
+                if 'weight' in benchmark_exposures.columns:
+                    benchmark_exposures.rename(columns={'weight':'weight_benchmark'}, inplace=True)
+
+                weights_df = weights_df.merge(benchmark_exposures[['date','sid','weight_benchmark']], how='left', on=['date','sid'])
+                # if 'weight_benchmark' not in weights_df.columns:
+                #     weights_df.rename(columns={'wgt':'weight_benchmark'}, inplace=True)
                 
                 weights_data = pd.concat([weights_data, weights_df])
 
@@ -676,14 +682,17 @@ if __name__=="__main__":
             aum=Decimal('100'),
             sigma_regimes=False,
             risk_factors=[
-                RiskFactors.SIZE, RiskFactors.MOMENTUM, RiskFactors.VALUE, RiskFactors.BETA
+                RiskFactors.SIZE, 
+                RiskFactors.MOMENTUM, 
+                RiskFactors.VALUE, 
+                RiskFactors.BETA
                 ],
             bench_weights=None,
             n_buckets=4
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.INDU,
+            universe=Universe.NDX, # INDU, NDX
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
             start='2018-12-31',
