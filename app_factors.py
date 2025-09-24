@@ -13,6 +13,9 @@ import boto3
 from botocore.exceptions import ClientError
 import json
 from typing import Dict, List, Optional
+import json
+from io import StringIO, BytesIO
+import io
 
 # Add src directory to path
 sys.path.append('./src/')
@@ -38,9 +41,156 @@ from src.qOptimization import (
     OptimizationObjective, OptimizationStatus
 )
 
+from src.portfolio_analysis import (
+    render_portfolio_upload_section, run_user_portfolio_analysis, render_portfolio_analysis_results)
+
+
 # S3 bucket and folder configuration
 S3_BUCKET = os.getenv('S3_BUCKET', 'your-bucket-name')
 S3_PREFIX = 'time_series/'
+
+def prepare_portfolio_download_data(portfolio_data: pd.DataFrame, data_type: str = "portfolio") -> pd.DataFrame:
+    """
+    Prepare portfolio data for download by cleaning and formatting.
+    
+    Args:
+        portfolio_data: DataFrame containing portfolio weights
+        data_type: Type of data ("portfolio", "returns", "meta")
+        
+    Returns:
+        Cleaned DataFrame ready for download
+    """
+    if portfolio_data is None or portfolio_data.empty:
+        return pd.DataFrame()
+    
+    # Create a copy to avoid modifying original data
+    df = portfolio_data.copy()
+    
+    # Ensure consistent column names
+    if 'sid' in df.columns and 'ticker' not in df.columns:
+        df['ticker'] = df['sid']
+    
+    # Format weights as percentages for better readability
+    if 'weight' in df.columns:
+        df['weight_pct'] = (df['weight'] * 100).round(4)
+        df['weight'] = df['weight'].round(6)
+    
+    # Sort by date and weight for better organization
+    if 'date' in df.columns:
+        df = df.sort_values(['date', 'weight'], ascending=[True, False])
+    
+    return df
+
+
+def create_download_file(df: pd.DataFrame, file_format: str, filename_prefix: str) -> bytes:
+    """
+    Create a file in the specified format for download.
+    
+    Args:
+        df: DataFrame to convert
+        file_format: Format to save ('csv', 'txt', 'parquet', 'json', 'xlsx')
+        filename_prefix: Prefix for the filename
+        
+    Returns:
+        Bytes object containing the file data
+    """
+    if df.empty:
+        return b""
+    
+    buffer = BytesIO()
+    
+    try:
+        if file_format == 'csv':
+            df.to_csv(buffer, index=True, encoding='utf-8')
+        elif file_format == 'txt':
+            df.to_csv(buffer, index=True, sep='\t', encoding='utf-8')
+        elif file_format == 'parquet':
+            df.to_parquet(buffer, index=True, engine='pyarrow')
+        elif file_format == 'json':
+            df.to_json(buffer, orient='records', date_format='iso', indent=2)
+        elif file_format == 'xlsx':
+            df.to_excel(buffer, index=True, engine='openpyxl')
+        else:
+            raise ValueError(f"Unsupported file format: {file_format}")
+        
+        buffer.seek(0)
+        return buffer.getvalue()
+    
+    except Exception as e:
+        st.error(f"Error creating {file_format} file: {str(e)}")
+        return b""
+    finally:
+        buffer.close()
+
+
+def render_download_section(data_dict: Dict[str, pd.DataFrame], section_title: str, key_prefix: str):
+    """
+    Render a download section with format selection and download buttons.
+    
+    Args:
+        data_dict: Dictionary of {name: DataFrame} pairs
+        section_title: Title for the download section
+        key_prefix: Prefix for Streamlit keys
+    """
+    st.subheader(f"📥 {section_title}")
+    
+    # File format selection
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        file_format = st.selectbox(
+            "Download Format",
+            options=['csv', 'txt', 'parquet', 'json', 'xlsx'],
+            index=0,
+            key=f"{key_prefix}_format"
+        )
+    
+    with col2:
+        st.info(f"💡 **{file_format.upper()}** format selected. Choose data to download below.")
+    
+    # Create download buttons for each dataset
+    # import pdb; pdb.set_trace()
+    for data_name, data_df in data_dict.items():
+        if data_df is not None and not data_df.empty:
+            # Prepare data for download
+            if 'weight' not in data_df.columns:
+                continue
+            prepared_data = prepare_portfolio_download_data(data_df, data_name)
+            
+            if not prepared_data.empty:
+                # Create filename
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{data_name}_{timestamp}.{file_format}"
+                
+                # Create download button
+                col1, col2, col3 = st.columns([2, 1, 1])
+                
+                with col1:
+                    st.write(f"**{data_name.replace('_', ' ').title()}** ({len(prepared_data)} rows)")
+                
+                with col2:
+                    if st.button(f"📊 Preview", key=f"{key_prefix}_preview_{data_name}"):
+                        st.dataframe(prepared_data.head(10), use_container_width=True)
+                
+                with col3:
+                    # Create file data
+                    file_data = create_download_file(prepared_data, file_format, data_name)
+                    
+                    if file_data:
+                        st.download_button(
+                            label="📥 Download",
+                            data=file_data,
+                            file_name=filename,
+                            mime=f"application/{file_format}" if file_format in ['csv', 'json'] else f"application/vnd.{file_format}",
+                            key=f"{key_prefix}_download_{data_name}"
+                        )
+                    else:
+                        st.error("❌ Download failed")
+            else:
+                st.warning(f"⚠️ No data available for {data_name}")
+        else:
+            st.warning(f"⚠️ No data available for {data_name}")
+
 
 def run_factor_analysis() -> Dict:
     """Run factor analysis and return results"""
@@ -119,104 +269,6 @@ def run_factor_analysis() -> Dict:
         st.error(f"Error in factor analysis: {str(e)}")
         return None
 
-def run_portfolio_optimization_v1() -> Dict:
-    """Run portfolio optimization and return results"""
-    try:
-        if not st.session_state.data_updated:
-            st.warning("Please update data first before running analysis.")
-            return None
-
-        cfg = FileConfig()
-        mgr = FileDataManager(cfg)
-
-        model_input = st.session_state.model_input
-        identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
-        factor_list = [i.value for i in model_input.params.risk_factors]
-
-        # df_ret_long = file_load_returns(model_input)
-        df_ret_long = mgr.load_returns(identifier+'_members')
-
-        df_ret_wide = df_ret_long[['date','sid','return']].pivot(
-            index='date', columns='sid', values='return')
-        df_ret_wide.fillna(0., inplace=True)
-
-        # df_exposures_long = file_load_exposures(model_input)
-        df_exposures_long = mgr.load_exposures(identifier+'_members')
-        df_exposures = df_exposures_long[['date','sid','variable','exposure']].pivot(
-            index=['date','sid'], columns='variable', values='exposure').reset_index(drop=False)
-        df_exposures.fillna(0., inplace=True)
-
-        if optimization_objective == OptimizationObjective.PURE_FACTOR.value:
-            # Pure factor optimization
-            df_pure_return = pd.DataFrame()
-            df_pure_portfolio = pd.DataFrame()
-
-            # # Create optimization constraints
-            for factor in factor_list:
-                st.success(f"Optimizing Pure Factor: {factor.title()}")
-
-                constraints = PurePortfolioConstraints(
-                    long_only=False,
-                    full_investment=True,
-                    factor_neutral=[i for i in factor_list if i!=factor],
-                    weight_bounds=(-0.05, 0.05),
-                    min_holding=0.01
-                )
-                
-                # Initialize optimizer
-                optimizer_pure = PureFactorOptimizer(
-                    target_factor=factor,
-                    constraints=constraints,
-                    normalize_weights=True,
-                    parallel_processing=False
-                )
-                # st.success(f"optimizer_pure constraints: {optimizer_pure.constraints}")
-
-                # Run optimization (example data not provided)
-                results = optimizer_pure.optimize(
-                    df_ret_wide, 
-                    df_exposures, 
-                    model_input.backtest.dates_turnover # [str(i) for i in dates_to]
-                )
-                df_portfolio = results.get('weights_data')
-                df_pure_portfolio = pd.concat([df_pure_portfolio, df_portfolio])
-
-                config = bt.BacktestConfig(
-                    asset_class=bt.AssetClass.EQUITY,
-                    portfolio_type=bt.PortfolioType.LONG_SHORT,
-                    model_type=factor,
-                    annualization_factor=252
-                    )
-
-                backtest = bt.Backtest(config=config)
-                df_portfolio.rename(columns={'sid':'ticker', 'weight':'weight'}, inplace=True)
-                df_returns = df_ret_long.copy()
-                df_returns.rename(columns={'sid':'ticker'}, inplace=True)
-                results_bt = backtest.run_backtest(df_returns, df_portfolio, plot=False)
-                df_ret_opt = backtest.df_pnl.copy()
-                    
-                df_pure_return = pd.concat([df_pure_return, df_ret_opt])
-
-            # Store pure factor returns
-            df_pure_return_wide = df_pure_return[['factor','return_opt']].pivot(columns='factor',values='return_opt')
-            st.session_state.pure_factor_returns = df_pure_return_wide
-            st.session_state.df_pure_portfolio = df_pure_portfolio            
-        else:
-            # Tracking error optimization
-            optimizer = TrackingErrorOptimizer(model_input)
-            constraints = TrackingErrorConstraints(
-                max_weight=max_weight/100.,
-                min_holding=0.001,
-                num_trades=num_trades,
-                tracking_error_max=tracking_error/100.
-            )
-            results = optimizer.optimize(constraints)
-
-        st.session_state.optimization_results = results
-        return results
-    except Exception as e:
-        st.error(f"Error in portfolio optimization: {str(e)}")
-        return None
 
 def run_tracking_error_optimization() -> Dict:
     """Run tracking error optimization and return results"""
@@ -608,7 +660,6 @@ def run_tracking_error_optimization() -> Dict:
         
         return None
 
-# Refactored portfolio optimization functions
 
 def run_portfolio_optimization() -> Dict:
     """
@@ -1815,12 +1866,13 @@ elif st.session_state.config_changed:
     run_data_update()
 
 # Main tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Factor Analysis",
-    "Portfolio Optimization",
+    "Portfolio Optimization", 
     "Pure Portfolios",
     "Tracking Error Optimization",
     "Risk Analysis",
+    "Portfolio Upload & Analysis",
     "Documentation"
 ])
 
@@ -2066,6 +2118,25 @@ with tab3:
             key="pure_factor_select"
         )
         
+        # Download section for Pure Portfolios
+        if st.session_state.df_pure_portfolio is not None:
+            # Prepare download data
+            download_data = {
+                "pure_factor_returns": filtered_returns,
+                "pure_portfolio_weights": st.session_state.df_pure_portfolio
+            }
+            
+            # Add factor-specific portfolio if a specific factor is selected
+            if selected_factor_pure != "All Factors":
+                factor_name = selected_factor_pure.lower()
+                factor_portfolio = st.session_state.df_pure_portfolio[
+                    st.session_state.df_pure_portfolio['factor'] == factor_name
+                ]
+                if not factor_portfolio.empty:
+                    download_data[f"{factor_name}_portfolio"] = factor_portfolio
+            
+            render_download_section(download_data, "Download Pure Factor Data", "pure_portfolios")
+        
         if selected_factor_pure == "All Factors":
             # Display all factors analysis
             st.subheader("Cumulative Factor Returns")
@@ -2073,24 +2144,19 @@ with tab3:
                 filtered_returns.cumsum(),
                 title="Cumulative Pure Factor Returns"
             )
-            # st.plotly_chart(fig, use_container_width=True)
             st.plotly_chart(fig, use_container_width=True, key="all_factors_cumulative")
             
             # Factor correlation matrix
-            # st.subheader("Factor Correlation Matrix")
             corr_matrix = filtered_returns.corr()
             correlation_matrix_display(corr_matrix, "all_pure_factors_correlation")
             
             # Monthly returns heatmap
-            # st.subheader("Monthly Factor Returns")
             monthly_returns = filtered_returns.resample('ME').sum()
-            # monthly_returns_heatmap(monthly_returns, "pure_portfolios")
             fig = px.imshow(
                 monthly_returns,
                 title="Monthly Factor Returns Heatmap",
                 color_continuous_scale='RdBu'
             )
-            # st.plotly_chart(fig, use_container_width=True)
             st.plotly_chart(fig, use_container_width=True, key="all_factors_monthly")
             
             # Summary statistics for all factors
@@ -2120,7 +2186,6 @@ with tab3:
                     factor_returns.cumsum(),
                     title=f"Cumulative Returns - {selected_factor_pure}"
                 )
-                # st.plotly_chart(fig, use_container_width=True)
                 st.plotly_chart(fig, use_container_width=True, key=f"single_factor_cumulative_{selected_factor_pure}")
 
                 # Monthly returns
@@ -2279,6 +2344,52 @@ with tab4:
         results = run_tracking_error_optimization()
     
     if st.session_state.te_optimization_results is not None:
+        # Download section for Tracking Error Optimization
+        download_data = {}
+        
+        # Add optimization results data
+        if st.session_state.te_optimization_results is not None:
+            meta_data = st.session_state.te_optimization_results.get('meta_data')
+            weights_data = st.session_state.te_optimization_results.get('weights_data')
+            
+            if meta_data is not None and not meta_data.empty:
+                download_data["optimization_metadata"] = meta_data
+            if weights_data is not None and not weights_data.empty:
+                download_data["optimal_portfolio_weights"] = weights_data
+        
+        # Add backtest results
+        if st.session_state.te_backtest_results is not None:
+            bt_results = st.session_state.te_backtest_results
+            # Convert backtest results to DataFrame for download
+            bt_summary = pd.DataFrame({
+                'Metric': [
+                    'Cumulative Return',
+                    'Sharpe Ratio',
+                    'Max Drawdown',
+                    'Volatility',
+                    'Total Trades',
+                    'Win Rate'
+                ],
+                'Value': [
+                    bt_results.cumulative_return_benchmark,
+                    bt_results.sharpe_ratio_benchmark,
+                    getattr(bt_results, 'max_drawdown_benchmark', 'N/A'),
+                    getattr(bt_results, 'volatility_benchmark', 'N/A'),
+                    getattr(bt_results, 'total_trades', 'N/A'),
+                    getattr(bt_results, 'win_rate', 'N/A')
+                ]
+            })
+            download_data["backtest_summary"] = bt_summary
+        
+        # Add portfolio returns
+        if st.session_state.te_portfolio_returns is not None:
+            download_data["portfolio_returns"] = st.session_state.te_portfolio_returns
+        
+        # Render download section
+        if download_data:
+            st.success(f"download_data - weights: {download_data['optimal_portfolio_weights'].head(2)}")
+            render_download_section(download_data, "Download Tracking Error Optimization Data", "te_optimization")
+        
         # Display optimization results
         st.subheader("Optimization Results")
         
@@ -2636,8 +2747,25 @@ with tab5:
     else:
         st.info("Please run factor analysis first to view risk analysis.")
 
+# Portfolio Upload & Analysis Tab  
+with tab6:  # Adjust index based on your tab order
+    st.header("Portfolio Upload & Analysis")
+    
+    # Upload section
+    uploaded_portfolio = render_portfolio_upload_section()
+    
+    # Analysis section
+    if st.button("Run Portfolio Analysis", type="primary"):
+        if 'user_portfolio' in st.session_state:
+            results = run_user_portfolio_analysis()
+        else:
+            st.error("Please upload a portfolio first.")
+    
+    # Results section
+    render_portfolio_analysis_results()
+
 # Documentation Tab
-with tab6:
+with tab7:
     st.header("Documentation")
     
     st.markdown("""
