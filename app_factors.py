@@ -2815,91 +2815,109 @@ with tab8:
     st.markdown("""
     ## Equity Factor Analysis Platform
 
-    This platform provides tools for equity factor analysis, portfolio optimization, and risk management.
-    
-    ### Data Management
-    
-    The platform allows you to:
-    - Update data from various sources (Yahoo Finance, Bloomberg, etc.)
-    - Sync data with cloud storage
-    - Manage historical data for different universes
+    A unified workspace for equity factor analytics, portfolio optimization, backtesting, and reporting.
 
-    ### Factor Analysis
+    ---
     
-    The Factor Analysis tab provides tools for analyzing individual factors:
-    - Cumulative returns of factor portfolios
-    - Factor distributions and statistics
-    - Turnover analysis
-    - Factor autocorrelation analysis
+    ### 1) Sidebar Configuration & Data Management
+    - Update or load existing datasets for a chosen universe and date range
+    - Configure factors, frequency, and optimization objective
+    - Optional cloud sync to S3
     
-    ### Portfolio Optimization
-    
-    The Portfolio Optimization tab offers two main approaches:
-    1. Pure Factor Optimization
-       - Creates pure factor portfolios
-       - Analyzes factor returns and correlations
-       - Provides monthly performance statistics
-    
-    2. Tracking Error Optimization
-       - Optimizes portfolios with tracking error constraints
-       - Controls number of trades
-       - Manages position weights
+    Example:
+    - Select Universe = NDX, Factors = beta/size/value/momentum, Start = 2019-12-31
+    - Click "Load Existing Data" (or "Update Data") to populate session data
 
-    ### Tracking Error Optimization
+    ---
     
-    The Tracking Error Optimization tab provides comprehensive tools for:
-    - **Portfolio Optimization**: Minimize tracking error while respecting factor constraints
-    - **Performance Analysis**: Compare optimized portfolio vs benchmark performance
-    - **Risk Management**: Monitor factor exposures and portfolio concentration
-    - **Turnover Analysis**: Track portfolio turnover and rebalancing costs
+    ### 2) Factor Analysis (Tab: Factor Analysis)
+    - View cumulative factor portfolio returns and monthly bars
+    - Inspect factor exposure distributions and turnover
+    - Analyze factor autocorrelation across constituents
     
-    Key features:
-    - Configurable factor constraints (range or tolerance-based)
-    - Position limits and concentration controls
-    - Integer constraints for realistic position counting
-    - Real-time optimization metrics and performance tracking
+    Example:
+    - Click "Run Factor Analysis" → choose a factor → see cumulative returns and summary stats
+
+    ---
     
-    ### Pure Factor Portfolios
+    ### 3) Portfolio Optimization (Tab: Portfolio Optimization)
+    - Run an optimization based on the selected objective in the sidebar
+    - If Pure Factor: creates pure factor portfolios and shows performance, correlations, monthly returns
+    - If Tracking Error: see TE-focused results (also detailed in its own tab)
     
-    This tab provides detailed analysis of pure factor portfolios:
-    - Performance metrics
-    - Holdings analysis
-    - Turnover statistics
-    - Factor exposure analysis
+    Example:
+    - Objective = Pure Factor → run → inspect cumulative factor returns and correlation matrix
+
+    ---
     
-    ### Risk Analysis
+    ### 4) Pure Factor Portfolios (Tab: Pure Portfolios)
+    - Filter pure factor returns by date, analyze per-factor performance
+    - Download pure factor returns and portfolio weights
+    - View holdings, turnover by rebalance, and rolling stats
     
-    The Risk Analysis tab provides:
-    - Factor risk decomposition
-    - Factor exposure analysis
-    - Volatility analysis
-    - Correlation analysis
+    Example:
+    - Choose "Momentum" → see cumulative returns, monthly bars, performance stats, latest holdings, turnover
+
+    ---
     
-    ### Configuration
+    ### 5) Tracking Error Optimization (Tab: Tracking Error Optimization)
+    - Configure TE constraints (long-only, weights, factor ranges/tolerances, TE max)
+    - Optimize vs benchmark; review metadata, holdings, concentration, turnover
+    - Backtest results: cumulative returns vs benchmark and rolling tracking error
+    - Download optimization metadata, weights, and backtest summaries
     
-    Use the sidebar to configure:
-    - Data source
-    - Universe selection
-    - Date range
-    - Rebalancing frequency
-    - Risk factors
-    - Optimization parameters
+    Example:
+    - Set TE max = 5%, Max names = 20 → run → review top holdings and TE over time
+
+    ---
     
-    ### Modules and Dependencies
+    ### 6) Risk Analysis (Tab: Risk Analysis)
+    - Factor risk decomposition and exposure analytics (when factor data available)
+    - Average factor volatility, exposure evolution, extreme exposures
     
-    This platform uses:
-    - `qFactor.py`: Factor data and analysis
-    - `qBacktest.py`: Backtesting framework
-    - `qOptimization.py`: Portfolio optimization
-    - `factor_file_etl.py`: Data processing and ETL
+    Example:
+    - Pick "value" → see average exposure over time and latest exposure distribution
+
+    ---
+    
+    ### 7) Portfolio Upload & Analysis (Tab: Portfolio Upload & Analysis)
+    - Upload or paste a portfolio with columns: `date, sid, weight`
+    - Validation feedback and summary
+    - Backtest-based outputs: cumulative returns (portfolio vs benchmark), summary stats
+      - Annualized return and volatility
+      - Sharpe ratio
+      - Max drawdown
+      - Daily VaR (95%/99%)
+      - Annual cumulative returns by year
+    - Weight comparison and concentration metrics
+    - Risk analysis output shown when factor data is available
+    
+    Example:
+    - Upload weights for several dates → click "Validate and Analyze" → run "Portfolio Analysis"
+    - Review cumulative returns chart and risk summary table (including VaR and drawdowns)
+
+    ---
+    
+    ### 8) Report (Tab: Report)
+    - Generate a consolidated PDF capturing factor analytics, optimization highlights, and uploaded portfolio analysis
+    - Customize title and file name; download the PDF
+
+    ---
+    
+    ### Modules
+    - `src/qBacktest.py`: backtesting and risk analytics utilities
+    - `src/qOptimization.py`: optimizers for pure factor and tracking error
+    - `src/qFactor.py`: factor definitions and analytics
+    - `src/portfolio_analysis.py`: portfolio upload, validation, backtest/risk UI
+    - `src/report_generator.py`: report builder
     
     ### Typical Workflow
-    
-    1. Configure settings in the sidebar
-    2. Update data
-    3. Run factor analysis
-    4. Run portfolio optimization
-    5. Analyze results in the tabs
+    1. Configure in sidebar → Load/Update data
+    2. Explore factors (Tab 1)
+    3. Run optimization (Tab 2 or 4)
+    4. Analyze pure factor portfolios (Tab 3)
+    5. Upload and analyze your portfolio (Tab 6) to get backtested performance and risk
+    6. Generate report (Tab 7)
     """)
     
     # Additional help sections
