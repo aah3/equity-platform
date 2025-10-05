@@ -12,6 +12,11 @@ from io import StringIO
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Add src directory to path
+# sys.path.append('./src/')
+
+import qBacktest as bt
+
 
 class PortfolioValidationResult(BaseModel):
     """Results from portfolio validation"""
@@ -189,12 +194,20 @@ class PortfolioComparator(BaseModel):
         results = {}
         
         # Align dates and securities across portfolios
+        if user_portfolio['date'].dtype == 'O':
+                user_portfolio['date'] = pd.to_datetime(user_portfolio['date'])
         common_dates = set(user_portfolio['date'].unique())
         if benchmark_weights is not None:
+            if benchmark_weights['date'].dtype == 'O':
+                benchmark_weights['date'] = pd.to_datetime(benchmark_weights['date'])
             common_dates &= set(benchmark_weights['date'].unique())
         if optimal_weights is not None:
+            if optimal_weights['date'].dtype == 'O':
+                optimal_weights['date'] = pd.to_datetime(optimal_weights['date'])
             common_dates &= set(optimal_weights['date'].unique())
-        
+        if returns_data['date'].dtype == 'O':
+            returns_data['date'] = pd.to_datetime(returns_data['date'])
+
         common_dates = sorted(list(common_dates))
         
         # Performance comparison
@@ -243,7 +256,7 @@ class PortfolioComparator(BaseModel):
             # User portfolio performance
             user_weights = user_portfolio[user_portfolio['date'] == date_str]
             if not user_weights.empty:
-                merged_user = user_weights.merge(date_returns, on='sid', how='inner')
+                merged_user = user_weights.merge(date_returns, on=['sid','date'], how='inner')
                 user_return = (merged_user['weight'] * merged_user['return']).sum()
             else:
                 user_return = np.nan
@@ -251,8 +264,8 @@ class PortfolioComparator(BaseModel):
             # Benchmark performance
             bench_weights = benchmark_weights[benchmark_weights['date'] == date_str]
             if not bench_weights.empty:
-                merged_bench = bench_weights.merge(date_returns, on='sid', how='inner')
-                bench_return = (merged_bench['wgt'] * merged_bench['return']).sum()
+                merged_bench = bench_weights.merge(date_returns, on=['sid','date'], how='inner')
+                bench_return = (merged_bench['weight'] * merged_bench['return']).sum()
             else:
                 bench_return = np.nan
             
@@ -261,7 +274,7 @@ class PortfolioComparator(BaseModel):
             if optimal_weights is not None:
                 opt_weights = optimal_weights[optimal_weights['date'] == date_str]
                 if not opt_weights.empty:
-                    merged_opt = opt_weights.merge(date_returns, on='sid', how='inner')
+                    merged_opt = opt_weights.merge(date_returns, on=['sid','date'], how='inner')
                     opt_return = (merged_opt['weight'] * merged_opt['return']).sum()
             
             performance_data.append({
@@ -296,7 +309,7 @@ class PortfolioComparator(BaseModel):
         # Merge and compare
         comparison_df = user_latest[['sid', 'weight']].rename(columns={'weight': 'user_weight'})
         comparison_df = comparison_df.merge(
-            bench_latest[['sid', 'wgt']].rename(columns={'wgt': 'benchmark_weight'}),
+            bench_latest[['sid', 'weight']].rename(columns={'weight': 'benchmark_weight'}),
             on='sid', how='outer'
         ).fillna(0)
         
@@ -319,9 +332,9 @@ class PortfolioComparator(BaseModel):
             'user_herfindahl': (user_latest['weight'] ** 2).sum(),
             'user_top5_weight': user_latest.nlargest(5, 'weight')['weight'].sum(),
             'user_top10_weight': user_latest.nlargest(10, 'weight')['weight'].sum(),
-            'benchmark_herfindahl': (bench_latest['wgt'] ** 2).sum(),
-            'benchmark_top5_weight': bench_latest.nlargest(5, 'wgt')['wgt'].sum(),
-            'benchmark_top10_weight': bench_latest.nlargest(10, 'wgt')['wgt'].sum(),
+            'benchmark_herfindahl': (bench_latest['weight'] ** 2).sum(),
+            'benchmark_top5_weight': bench_latest.nlargest(5, 'weight')['weight'].sum(),
+            'benchmark_top10_weight': bench_latest.nlargest(10, 'weight')['weight'].sum(),
         }
         
         weight_analysis['concentration'] = pd.DataFrame([concentration_metrics])
@@ -365,7 +378,7 @@ class PortfolioComparator(BaseModel):
         user_turnover = calculate_turnover(user_portfolio, 'weight')
         user_turnover['portfolio'] = 'user'
         
-        bench_turnover = calculate_turnover(benchmark_weights, 'wgt') 
+        bench_turnover = calculate_turnover(benchmark_weights, 'weight') 
         bench_turnover['portfolio'] = 'benchmark'
         
         turnover_comparison = pd.concat([user_turnover, bench_turnover])
@@ -457,12 +470,15 @@ class PortfolioAnalyzer(BaseModel):
         
         # Prepare data for backtest
         df_portfolio = portfolio_weights.copy()
-        df_portfolio.rename(columns={'sid': 'ticker'}, inplace=True)
+        if ('ticker' not in df_portfolio.columns) & ('sid' in df_portfolio.columns):
+            df_portfolio.rename(columns={'sid': 'ticker'}, inplace=True)
         
         df_returns = returns_data.copy()
         df_returns.rename(columns={'sid': 'ticker'}, inplace=True)
-        
+        if ('ticker' not in df_returns.columns) & ('sid' in df_returns.columns):
+            df_returns.rename(columns={'sid': 'ticker'}, inplace=True)
         # Run backtest
+        # import pdb; pdb.set_trace()
         results_bt = backtest.run_backtest(df_returns, df_portfolio, plot=False)
         
         return {
@@ -643,31 +659,90 @@ def render_portfolio_analysis_results():
     
     results = st.session_state.user_portfolio_analysis
     
-    # Performance Comparison
-    if 'comparison' in results and 'performance' in results['comparison']:
-        st.subheader("Performance Comparison")
-        
-        perf_data = results['comparison']['performance']
-        
-        # Cumulative returns chart
-        fig = px.line(
-            perf_data,
+    # Backtest results and risk/summary statistics
+    if 'backtest' in results and 'daily_returns' in results['backtest']:
+        st.subheader("Backtest Results: Cumulative Returns")
+
+        df_pnl = results['backtest']['daily_returns'].copy()
+        df_pnl = df_pnl.reset_index()
+        if not pd.api.types.is_datetime64_any_dtype(df_pnl['date']):
+            df_pnl['date'] = pd.to_datetime(df_pnl['date'])
+
+        # Compute compounded cumulative returns time series
+        cum_ts = pd.DataFrame({
+            'date': df_pnl['date'],
+            'benchmark_cumret': (1.0 + df_pnl['return_benchmark']).cumprod() - 1.0,
+            'portfolio_cumret': (1.0 + df_pnl['return_opt']).cumprod() - 1.0
+        })
+
+        fig_cum = px.line(
+            cum_ts,
             x='date',
-            y=['user_return', 'benchmark_return', 'optimal_return'],
-            title="Portfolio Performance Comparison"
+            y=['benchmark_cumret', 'portfolio_cumret'],
+            labels={'value': 'Cumulative Return', 'variable': 'Series'},
+            title="Cumulative Returns: Benchmark vs Portfolio"
         )
-        fig.update_layout(yaxis_tickformat='.2%')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Performance metrics
-        perf_metrics = perf_data[['user_return', 'benchmark_return', 'optimal_return']].dropna()
-        metrics_summary = pd.DataFrame({
-            'Annualized Return': perf_metrics.mean() * 252,
-            'Volatility': perf_metrics.std() * np.sqrt(252),
-            'Sharpe Ratio': (perf_metrics.mean() * 252) / (perf_metrics.std() * np.sqrt(252))
-        }).round(4)
-        
-        st.dataframe(metrics_summary)
+        fig_cum.update_layout(yaxis_tickformat='.2%')
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+        # Helper functions for risk metrics
+        def compute_max_drawdown(cum_returns: pd.Series) -> float:
+            wealth = 1.0 + cum_returns
+            running_max = wealth.cummax()
+            drawdown = wealth / running_max - 1.0
+            return drawdown.min()
+
+        def compute_var(returns: pd.Series, alpha: float = 0.95) -> float:
+            return -np.nanpercentile(returns.dropna(), (1 - alpha) * 100)
+
+        def summarize_returns(returns: pd.Series, ann_factor: int = 252) -> Dict[str, float]:
+            mu = returns.mean()
+            sigma = returns.std()
+            ann_ret = (1.0 + mu) ** ann_factor - 1.0
+            ann_vol = sigma * np.sqrt(ann_factor)
+            sharpe = ann_ret / ann_vol if ann_vol not in (0, np.nan) else np.nan
+            var_95 = compute_var(returns, 0.95)
+            var_99 = compute_var(returns, 0.99)
+            return {
+                'Annualized Return': ann_ret,
+                'Annualized Volatility': ann_vol,
+                'Sharpe Ratio': sharpe,
+                'Daily VaR 95%': var_95,
+                'Daily VaR 99%': var_99,
+            }
+
+        # Build summary tables
+        bench_metrics = summarize_returns(df_pnl['return_benchmark'])
+        port_metrics = summarize_returns(df_pnl['return_opt'])
+
+        # Max drawdowns (from compounded cumulative series)
+        mdd_bench = compute_max_drawdown(cum_ts['benchmark_cumret'])
+        mdd_port = compute_max_drawdown(cum_ts['portfolio_cumret'])
+        bench_metrics['Max Drawdown'] = mdd_bench
+        port_metrics['Max Drawdown'] = mdd_port
+
+        summary_df = pd.DataFrame([bench_metrics, port_metrics], index=['Benchmark', 'Portfolio']).T
+        summary_df = summary_df.map(lambda x: round(x, 6) if isinstance(x, (int, float, np.floating)) else x)
+        st.subheader("Summary Statistics")
+        st.dataframe(summary_df.style.format({
+            'Annualized Return': '{:.2%}',
+            'Annualized Volatility': '{:.2%}',
+            'Sharpe Ratio': '{:.2f}',
+            'Daily VaR 95%': '{:.2%}',
+            'Daily VaR 99%': '{:.2%}',
+            'Max Drawdown': '{:.2%}'
+        }))
+
+        # Annual returns by calendar year (compounded)
+        yearly = df_pnl.copy()
+        yearly['year'] = yearly['date'].dt.year
+        yearly_summary = yearly.groupby('year').agg({
+            'return_benchmark': lambda s: (1.0 + s).prod() - 1.0,
+            'return_opt': lambda s: (1.0 + s).prod() - 1.0
+        }).rename(columns={'return_benchmark': 'Benchmark', 'return_opt': 'Portfolio'})
+
+        st.subheader("Annual Cumulative Returns by Year")
+        st.dataframe(yearly_summary.style.format('{:.2%}'))
     
     # Weight Analysis
     if 'comparison' in results and 'weight_analysis' in results['comparison']:
@@ -691,9 +766,16 @@ def render_portfolio_analysis_results():
             }))
     
     # Risk Analysis (if available)
-    if results.get('risk_analysis'):
+    if results.get('risk_analysis') is not None:
         st.subheader("Risk Analysis")
-        st.info("Risk analysis functionality would be displayed here")
+        risk_output = results.get('risk_analysis', {})
+        if isinstance(risk_output, dict) and len(risk_output) == 0:
+            st.info("Risk analysis is enabled but detailed outputs are not available in this build.")
+        else:
+            try:
+                st.json(risk_output)
+            except Exception:
+                st.write(risk_output)
 
 def run_user_portfolio_analysis():
     """Run comprehensive analysis on user portfolio"""
@@ -728,6 +810,7 @@ def run_user_portfolio_analysis():
         
         # Run analysis
         analyzer = PortfolioAnalyzer()
+        # import pdb; pdb.set_trace()
         analysis_results = analyzer.analyze_user_portfolio(
             user_portfolio,
             st.session_state.model_input,

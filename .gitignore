@@ -56,3 +56,5 @@ src/factor_db_example.py
 src/factor_file_etl_v1.py
 src/file_data_manager_v1.py
 src/test_postgres.py
+src/index_report_template.py
+financial_dashboard.pdf

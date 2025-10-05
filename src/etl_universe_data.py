@@ -239,7 +239,7 @@ if __name__ == "__main__":
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.INDU, # INDU, NDX
+            universe=Universe.NDX, # INDU, NDX
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
             start='2017-12-31', # '2022-12-31',

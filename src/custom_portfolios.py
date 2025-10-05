@@ -250,7 +250,7 @@ class PortfolioComparator(BaseModel):
             bench_weights = benchmark_weights[benchmark_weights['date'] == date_str]
             if not bench_weights.empty:
                 merged_bench = bench_weights.merge(date_returns, on='sid', how='inner')
-                bench_return = (merged_bench['wgt'] * merged_bench['return']).sum()
+                bench_return = (merged_bench['weight'] * merged_bench['return']).sum()
             else:
                 bench_return = np.nan
             
@@ -294,7 +294,7 @@ class PortfolioComparator(BaseModel):
         # Merge and compare
         comparison_df = user_latest[['sid', 'weight']].rename(columns={'weight': 'user_weight'})
         comparison_df = comparison_df.merge(
-            bench_latest[['sid', 'wgt']].rename(columns={'wgt': 'benchmark_weight'}),
+            bench_latest[['sid', 'weight']].rename(columns={'weight': 'benchmark_weight'}),
             on='sid', how='outer'
         ).fillna(0)
         
@@ -317,9 +317,9 @@ class PortfolioComparator(BaseModel):
             'user_herfindahl': (user_latest['weight'] ** 2).sum(),
             'user_top5_weight': user_latest.nlargest(5, 'weight')['weight'].sum(),
             'user_top10_weight': user_latest.nlargest(10, 'weight')['weight'].sum(),
-            'benchmark_herfindahl': (bench_latest['wgt'] ** 2).sum(),
-            'benchmark_top5_weight': bench_latest.nlargest(5, 'wgt')['wgt'].sum(),
-            'benchmark_top10_weight': bench_latest.nlargest(10, 'wgt')['wgt'].sum(),
+            'benchmark_herfindahl': (bench_latest['weight'] ** 2).sum(),
+            'benchmark_top5_weight': bench_latest.nlargest(5, 'weight')['weight'].sum(),
+            'benchmark_top10_weight': bench_latest.nlargest(10, 'weight')['weight'].sum(),
         }
         
         weight_analysis['concentration'] = pd.DataFrame([concentration_metrics])
@@ -363,7 +363,7 @@ class PortfolioComparator(BaseModel):
         user_turnover = calculate_turnover(user_portfolio, 'weight')
         user_turnover['portfolio'] = 'user'
         
-        bench_turnover = calculate_turnover(benchmark_weights, 'wgt') 
+        bench_turnover = calculate_turnover(benchmark_weights, 'weight') 
         bench_turnover['portfolio'] = 'benchmark'
         
         turnover_comparison = pd.concat([user_turnover, bench_turnover])

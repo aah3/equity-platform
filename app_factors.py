@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 import json
 from io import StringIO, BytesIO
 import io
+from io import BytesIO
 
 # Add src directory to path
 sys.path.append('./src/')
@@ -43,6 +44,7 @@ from src.qOptimization import (
 
 from src.portfolio_analysis import (
     render_portfolio_upload_section, run_user_portfolio_analysis, render_portfolio_analysis_results)
+from src.report_generator import AppReportBuilder
 
 
 # S3 bucket and folder configuration
@@ -539,7 +541,7 @@ def run_tracking_error_optimization() -> Dict:
 
         # Backtest TE portfolio
         df_weights = results_te['weights_data'].copy()
-        df_weights = df_weights.sort_values(['sid','date'])
+        df_weights = df_weights.sort_values(['date','sid'])
 
         # Calculate number of securities in optimal portfolio
         df_weights['n_opt'] = df_weights['weight'] != 0
@@ -1866,13 +1868,14 @@ elif st.session_state.config_changed:
     run_data_update()
 
 # Main tabs
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Factor Analysis",
     "Portfolio Optimization", 
     "Pure Portfolios",
     "Tracking Error Optimization",
     "Risk Analysis",
     "Portfolio Upload & Analysis",
+    "Report",
     "Documentation"
 ])
 
@@ -2133,7 +2136,7 @@ with tab3:
                     st.session_state.df_pure_portfolio['factor'] == factor_name
                 ]
                 if not factor_portfolio.empty:
-                    download_data[f"{factor_name}_portfolio"] = factor_portfolio
+                    download_data[f"{factor_name}_portfolio"] = factor_portfolio.sort_values(['date','weight'])
             
             render_download_section(download_data, "Download Pure Factor Data", "pure_portfolios")
         
@@ -2764,8 +2767,49 @@ with tab6:  # Adjust index based on your tab order
     # Results section
     render_portfolio_analysis_results()
 
-# Documentation Tab
+# Report Tab
 with tab7:
+    st.header("Generate & Download Report")
+
+    st.markdown("This report summarizes data across tabs: factor returns (1D/MTD/QTD/YTD), volatility, Sharpe ratios, optimization highlights, and uploaded portfolio analysis if available.")
+
+    # Gather data from session state
+    pure_factor_returns = st.session_state.pure_factor_returns if 'pure_factor_returns' in st.session_state else None
+    te_results = st.session_state.te_optimization_results if 'te_optimization_results' in st.session_state else None
+    te_meta = te_results.get('meta_data') if isinstance(te_results, dict) else None
+    te_weights = te_results.get('weights_data') if isinstance(te_results, dict) else None
+    te_returns = st.session_state.te_portfolio_returns if 'te_portfolio_returns' in st.session_state else None
+
+    uploaded_portfolio_results = st.session_state.user_portfolio_analysis if 'user_portfolio_analysis' in st.session_state else None
+
+    col1, col2 = st.columns(2)
+    with col1:
+        report_title = st.text_input("Report Title", value="Equity Factor Analysis Report")
+    with col2:
+        filename = st.text_input("File Name", value=f"equity_report_{datetime.now().strftime('%Y%m%d')}.pdf")
+
+    if st.button("Generate Report", type="primary"):
+        try:
+            builder = AppReportBuilder(title=report_title)
+            pdf_bytes = builder.build_pdf_bytes(
+                pure_factor_returns=pure_factor_returns,
+                te_meta=te_meta,
+                te_weights=te_weights,
+                te_returns=te_returns,
+                uploaded_portfolio_results=uploaded_portfolio_results,
+            )
+            st.success("Report generated")
+            st.download_button(
+                label="Download PDF",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.error(f"Failed to generate report: {e}")
+
+# Documentation Tab
+with tab8:
     st.header("Documentation")
     
     st.markdown("""
