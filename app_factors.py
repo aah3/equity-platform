@@ -2896,6 +2896,16 @@ with tab8:
     - Upload weights for several dates → click "Validate and Analyze" → run "Portfolio Analysis"
     - Review cumulative returns chart and risk summary table (including VaR and drawdowns)
 
+    Portfolio CSV format:
+    - Required columns: `date`, `sid`, `weight`
+    - Optional columns (ignored if present): `beta`, `momentum`, `size`, `value`, `weight_benchmark`, `ticker`, `weight_pct`
+    
+    ```csv
+    date,sid,weight,beta,momentum,size,value,weight_benchmark,ticker,weight_pct
+    2018-12-31,AMGN,0.15,-0.05960922728752476,0.8634686783412702,0.04173120673367438,1.8747967720391034,0.0414,AMGN,15.0
+    2018-12-31,HON,0.15,-0.3326811773788496,-0.2949065269693901,0.12497644088529401,-0.1901591543645887,0.0327,HON,15.0
+    ```
+
     ---
     
     ### 8) Report (Tab: Report)
