@@ -1,0 +1,366 @@
+# Cursor Rules for Equity Factor Analysis Platform
+
+## Project Context
+
+This is the **Equity Factor Analysis Platform** - a comprehensive Streamlit application for financial analytics, portfolio optimization, and risk management. The platform provides tools for factor analysis, portfolio optimization, backtesting, and reporting.
+
+## Core Technologies
+
+- **Frontend**: Streamlit web application
+- **Backend**: Python with Pydantic models
+- **Data Processing**: Pandas, NumPy, financial libraries
+- **Optimization**: CVXPY, custom optimization algorithms
+- **Storage**: SQLite, Parquet files, AWS S3
+- **Visualization**: Plotly, matplotlib
+
+## Code Standards
+
+### 1. Python Style
+- Use **Python 3.10+** features
+- Follow **PEP 8** style guide
+- Use **type hints** for all functions and methods
+- Write **comprehensive docstrings** for all public functions
+- Use **Pydantic BaseModel** for data validation
+- Use **@field_validator** instead of **@validator** decorator
+
+### 2. Data Validation
+```python
+from pydantic import BaseModel, Field, field_validator
+from typing import Dict, List, Optional, Union
+from decimal import Decimal
+
+class PortfolioConfig(BaseModel):
+    aum: Decimal = Field(..., description="Assets under management")
+    max_weight: float = Field(default=0.05, ge=0, le=1, description="Maximum position weight")
+    
+    @field_validator('aum')
+    @classmethod
+    def validate_aum(cls, v):
+        if v <= 0:
+            raise ValueError('AUM must be positive')
+        return v
+```
+
+### 3. Error Handling
+```python
+def robust_operation():
+    try:
+        result = perform_operation()
+        return result
+    except DataValidationError as e:
+        st.error(f"Data validation error: {str(e)}")
+        return None
+    except Exception as e:
+        st.error(f"Unexpected error: {str(e)}")
+        logger.exception("Operation failed")
+        return None
+```
+
+## Architecture Patterns
+
+### 1. Module Structure
+- **`src/qFactor.py`**: Factor analytics and data models
+- **`src/qOptimization.py`**: Portfolio optimization algorithms
+- **`src/qBacktest.py`**: Backtesting framework
+- **`src/portfolio_analysis.py`**: Portfolio analysis and validation
+- **`src/file_data_manager.py`**: Data management and file operations
+- **`src/etl_universe_data.py`**: ETL pipeline for data processing
+
+### 2. Data Flow
+```
+User Input → Streamlit UI → Business Logic → Data Processing → Storage
+                ↓
+        Validation → Optimization → Backtesting → Results Display
+```
+
+### 3. Session State Management
+```python
+# Initialize session state variables
+if 'model_input' not in st.session_state:
+    st.session_state.model_input = None
+if 'factor_data' not in st.session_state:
+    st.session_state.factor_data = None
+```
+
+## Key Classes and Functions
+
+### 1. Core Classes
+- **`EquityFactor`**: Factor analysis and portfolio construction
+- **`EquityFactorModelInput`**: Configuration management
+- **`PureFactorOptimizer`**: Pure factor portfolio optimization
+- **`TrackingErrorOptimizer`**: Tracking error optimization
+- **`Backtest`**: Portfolio backtesting engine
+- **`PortfolioAnalyzer`**: Portfolio analysis and validation
+
+### 2. Important Functions
+- **`run_factor_analysis()`**: Main factor analysis function
+- **`run_portfolio_optimization()`**: Portfolio optimization orchestration
+- **`run_tracking_error_optimization()`**: TE optimization implementation
+- **`etl_universe_data()`**: ETL pipeline for data processing
+- **`load_existing_data()`**: Data loading and validation
+
+## Development Guidelines
+
+### 1. When Adding New Features
+- Follow existing code patterns and architecture
+- Use Pydantic models for data validation
+- Implement comprehensive error handling
+- Add unit tests for new functionality
+- Update documentation and docstrings
+- Consider performance implications
+- Ensure security best practices
+
+### 2. When Fixing Bugs
+- Reproduce the issue with test cases
+- Implement minimal fix with proper error handling
+- Add regression tests
+- Update relevant documentation
+- Consider impact on other components
+
+### 3. When Optimizing Performance
+- Profile code to identify bottlenecks
+- Use efficient data structures and algorithms
+- Implement caching where appropriate
+- Consider memory usage and scalability
+- Validate performance improvements with tests
+
+## Testing Requirements
+
+### 1. Unit Tests
+- Test all public functions and methods
+- Cover edge cases and error conditions
+- Use mock data for external dependencies
+- Maintain high test coverage (>90%)
+
+### 2. Integration Tests
+- Test complete workflows and data pipelines
+- Validate optimization algorithms
+- Test Streamlit UI interactions
+- Ensure data consistency and accuracy
+
+### 3. Performance Tests
+- Test optimization performance with large datasets
+- Validate data loading and processing speed
+- Monitor memory usage and scalability
+- Benchmark critical operations
+
+## Data Management
+
+### 1. Data Formats
+- **Parquet**: Time series data (efficient compression)
+- **CSV**: Portfolio uploads and exports
+- **SQLite**: Metadata and configuration
+- **JSON**: Configuration files
+
+### 2. Data Validation
+```python
+def validate_portfolio_data(df: pd.DataFrame) -> bool:
+    required_columns = ['date', 'sid', 'weight']
+    if not all(col in df.columns for col in required_columns):
+        raise ValueError(f"Missing required columns: {required_columns}")
+    return True
+```
+
+### 3. Error Handling for Data Operations
+- Validate input data format and content
+- Handle missing or corrupted data gracefully
+- Provide meaningful error messages
+- Log data processing errors for debugging
+
+## Streamlit Best Practices
+
+### 1. UI Components
+```python
+# Use columns for layout
+col1, col2, col3 = st.columns([2, 1, 1])
+
+with col1:
+    st.write("Main content")
+with col2:
+    st.metric("Key metric", "Value")
+with col3:
+    st.button("Action", key="unique_key")
+```
+
+### 2. Session State
+```python
+# Use consistent naming patterns
+st.session_state.data_updated = True
+st.session_state.config_changed = False
+```
+
+### 3. Error Display
+```python
+try:
+    results = run_analysis()
+    st.success("Analysis completed successfully!")
+except Exception as e:
+    st.error(f"Analysis failed: {str(e)}")
+    with st.expander("Debug Information"):
+        st.code(traceback.format_exc())
+```
+
+## Security Considerations
+
+### 1. Data Security
+- Validate all user inputs
+- Sanitize data before processing
+- Use secure file handling
+- Implement proper access controls
+
+### 2. Configuration Security
+- Store sensitive data in environment variables
+- Use secure credential management
+- Implement proper authentication
+- Follow least privilege principles
+
+## Performance Optimization
+
+### 1. Caching
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def load_factor_data_cached(identifier: str) -> pd.DataFrame:
+    return load_factor_data(identifier)
+```
+
+### 2. Memory Management
+- Process large datasets in chunks
+- Use efficient data structures
+- Monitor memory usage
+- Implement garbage collection where needed
+
+## Documentation Requirements
+
+### 1. Code Documentation
+```python
+def calculate_sharpe_ratio(
+    returns: pd.Series,
+    risk_free_rate: float = 0.0,
+    annualization_factor: int = 252
+) -> float:
+    """
+    Calculate the Sharpe ratio for a return series.
+    
+    Args:
+        returns: Series of returns (daily frequency)
+        risk_free_rate: Risk-free rate (annual)
+        annualization_factor: Days per year for annualization
+        
+    Returns:
+        Annualized Sharpe ratio
+        
+    Raises:
+        ValueError: If returns is empty or has insufficient data
+    """
+```
+
+### 2. API Documentation
+- Document all public functions and classes
+- Provide examples and use cases
+- Include parameter descriptions
+- Document return values and exceptions
+
+## Common Patterns
+
+### 1. Data Loading Pattern
+```python
+def load_data_with_validation(identifier: str) -> Optional[pd.DataFrame]:
+    try:
+        data = data_manager.load_data(identifier)
+        if data is None or data.empty:
+            st.warning(f"No data found for {identifier}")
+            return None
+        return data
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        return None
+```
+
+### 2. Optimization Pattern
+```python
+def run_optimization_with_progress():
+    with st.spinner("Running optimization..."):
+        try:
+            results = optimizer.optimize(data)
+            st.success("Optimization completed!")
+            return results
+        except Exception as e:
+            st.error(f"Optimization failed: {str(e)}")
+            return None
+```
+
+### 3. Results Display Pattern
+```python
+def display_optimization_results(results: Dict):
+    if results is None:
+        st.warning("No results to display")
+        return
+    
+    # Display metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Return", f"{results['return']:.2%}")
+    with col2:
+        st.metric("Risk", f"{results['risk']:.2%}")
+    with col3:
+        st.metric("Sharpe", f"{results['sharpe']:.2f}")
+    
+    # Display charts
+    st.plotly_chart(results['chart'])
+```
+
+## File Organization
+
+### 1. Project Structure
+```
+src/
+├── qFactor.py              # Factor analytics
+├── qOptimization.py        # Optimization algorithms
+├── qBacktest.py           # Backtesting framework
+├── portfolio_analysis.py   # Portfolio analysis
+├── file_data_manager.py    # Data management
+├── etl_universe_data.py    # ETL pipeline
+├── report_generator.py     # Report generation
+└── utils.py               # Utility functions
+```
+
+### 2. Import Organization
+```python
+# Standard library imports
+import os
+import sys
+from datetime import date, datetime
+from typing import Dict, List, Optional
+
+# Third-party imports
+import pandas as pd
+import numpy as np
+import streamlit as st
+from pydantic import BaseModel, Field, field_validator
+
+# Local imports
+from src.qFactor import EquityFactor, EquityFactorModelInput
+from src.qOptimization import PureFactorOptimizer, TrackingErrorOptimizer
+```
+
+## Quality Assurance
+
+### 1. Code Review Checklist
+- [ ] Follows established patterns and architecture
+- [ ] Uses Pydantic models for data validation
+- [ ] Implements proper error handling
+- [ ] Includes comprehensive logging
+- [ ] Follows security best practices
+- [ ] Includes unit tests
+- [ ] Updates documentation
+
+### 2. Performance Checklist
+- [ ] Efficient data processing
+- [ ] Proper memory management
+- [ ] Optimized algorithms
+- [ ] Caching where appropriate
+- [ ] Scalable design
+
+This configuration ensures consistent, high-quality development of the Equity Factor Analysis Platform while maintaining the flexibility needed for financial analytics development.
