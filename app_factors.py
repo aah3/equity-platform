@@ -19,32 +19,32 @@ import io
 from io import BytesIO
 
 # Add src directory to path
-sys.path.append('./src/')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-import src.qBacktest as bt
+import qBacktest as bt
 
-from src.qFactor import (
+from qFactor import (
     EquityFactor, EquityFactorModelInput, RiskFactors, 
     ParamsConfig, BacktestConfig, RegimeConfig, ExportConfig, OptimizationConfig,
     Universe, Currency, Frequency, DataSource, VolatilityType, RegimeType,
     SecurityMasterFactory, FactorFactory, get_rebalance_dates, set_model_input_dates_turnover,
-    set_model_input_dates_daily
+    set_model_input_dates_daily, merge_weights_with_factor_loadings
 )
-from src.etl_universe_data import etl_universe_data
+from etl_universe_data import etl_universe_data
 
-from src.file_data_manager import (
+from file_data_manager import (
     FileConfig, FileDataManager
     )
 
-from src.qOptimization import (
+from qOptimization import (
     PureFactorOptimizer, PurePortfolioConstraints,
     TrackingErrorOptimizer, TrackingErrorConstraints,
     OptimizationObjective, OptimizationStatus
 )
 
-from src.portfolio_analysis import (
+from portfolio_analysis import (
     render_portfolio_upload_section, run_user_portfolio_analysis, render_portfolio_analysis_results)
-from src.report_generator import AppReportBuilder
+from report_generator import AppReportBuilder
 
 
 # S3 bucket and folder configuration
@@ -109,7 +109,13 @@ def create_download_file(df: pd.DataFrame, file_format: str, filename_prefix: st
         elif file_format == 'parquet':
             df.to_parquet(buffer, index=True, engine='pyarrow')
         elif file_format == 'json':
-            df.to_json(buffer, orient='records', date_format='iso', indent=2)
+            # to_json does not support BytesIO as a buffer for text-based content,
+            # so we need to use a StringIO, then encode to bytes
+            import io
+            str_buffer = io.StringIO()
+            df.to_json(str_buffer, orient='records', date_format='iso', indent=2)
+            buffer.write(str_buffer.getvalue().encode('utf-8'))
+            str_buffer.close()
         elif file_format == 'xlsx':
             df.to_excel(buffer, index=True, engine='openpyxl')
         else:
@@ -206,15 +212,15 @@ def run_factor_analysis() -> Dict:
     try:        
         if not st.session_state.data_updated:
             st.warning("Please update data first before running analysis.")
-            return None
+            return {}
 
         if 'model_input' not in st.session_state:
             st.error("Model input not found. Please run data update first.")
-            return None
+            # Return empty dict to match expected return type
+            return {}
 
         # Get model input from session state
         model_input = st.session_state.model_input
-        # st.success(f"Model Input: {model_input.backtest}")
 
         # Run factor analysis
         # factor_data = file_load_factors(model_input)
@@ -227,7 +233,7 @@ def run_factor_analysis() -> Dict:
 
         if factor_data_dict is None or df_ret_long is None:
             st.error("Failed to load factor data or returns. Please check if data update completed successfully.")
-            return None
+            return {}
 
         # Convert factor_data_dict to a dictionary of DataFrames   
         # factor_data = factor_data_dict
@@ -236,12 +242,18 @@ def run_factor_analysis() -> Dict:
         st.session_state.factor_data = factor_data
         st.session_state.df_ret_long = df_ret_long
 
+        # NEW: included benchmark weights for merging
+        df_benchmark_weights = mgr.load_benchmark_weights(identifier)
+
         # Initialize results dictionary
         results = {}
         
         # Analyze each factor
         for factor_name, factor_df in factor_data.items():
             st.success(f"Running factor {factor_name}")
+
+            # NEW: merge benchmark weights with factor_df
+            factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
 
             # Create EquityFactor instance
             factor = EquityFactor(
@@ -1931,9 +1943,20 @@ with tab1:
             # Factor autocorrelation
             st.subheader("Factor Autocorrelation")
             # Calculate autocorrelation for each security's factor exposure
-            factor_data = st.session_state.factor_data[selected_factor]
-            wide_data = factor_data.pivot(index='date', columns='sid', values='value')
-            
+            # factor_data = st.session_state.factor_data[selected_factor]
+            # wide_data = factor_data.pivot(index='date', columns='sid', values='value')
+            factor_data = st.session_state.get("factor_data")
+            if factor_data is None or selected_factor not in factor_data or factor_data[selected_factor] is None:
+                st.error(f"No factor data found for '{selected_factor}'.")
+                wide_data = pd.DataFrame()
+            else:
+                df_selected_factor = factor_data[selected_factor]
+                if not {'date', 'sid', 'value'}.issubset(df_selected_factor.columns):
+                    st.error("Required columns ('date', 'sid', 'value') not found in factor data.")
+                    wide_data = pd.DataFrame()
+                else:
+                    wide_data = df_selected_factor.pivot(index='date', columns='sid', values='value')
+
             # Calculate autocorrelation for each security
             autocorr_dict = {}
             for col in wide_data.columns:

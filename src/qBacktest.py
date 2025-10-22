@@ -18,6 +18,81 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Helper functions
+def smart_forward_fill_weights_optimized(
+    df: pd.DataFrame,
+    weight_cols: Optional[List[str]] = None,
+    date_col: str = "date",
+    id_col: str = "ticker",
+    ) -> pd.DataFrame:
+    """
+    Forward-fill weights within rebalance intervals, but only for tickers that
+    have non-NA weights at the start of each interval. If a ticker is not
+    present (NA) on a rebalance date, it will not appear in that interval
+    (no carry from prior intervals).
+
+    Args:
+        df: DataFrame with at least [date_col, id_col] and weight columns.
+        weight_cols: If None, auto-detects weight columns as those not in
+                     [date_col, id_col, 'return'].
+        date_col: Name of the date column.
+        id_col: Name of the security identifier column.
+
+    Returns:
+        DataFrame with weights forward-filled per the rules.
+    """
+    out = df.copy()
+
+    # Auto-detect weight columns
+    if weight_cols is None:
+        reserved = {date_col, id_col, "return"}
+        weight_cols = [c for c in out.columns if c not in reserved]
+
+    # Normalize/Sort dates
+    out[date_col] = pd.to_datetime(out[date_col])
+    out.sort_values([date_col, id_col], inplace=True)
+
+    # Row-level "has any data" across weight columns
+    out["_row_has_data"] = out[weight_cols].notna().any(axis=1)
+
+    # A "rebalance date" is any date where at least one row has data
+    # Broadcast per-row via transform, then assign a global interval id
+    rebalance_flag_by_date = (
+        out.groupby(date_col)["_row_has_data"].transform("max").astype(int)
+    )
+
+    # Build a date->rebalance_id map so the cumsum increments once per date
+    date_map = (
+        out[[date_col]]
+        .drop_duplicates()
+        .merge(
+            out.groupby(date_col)["_row_has_data"].max().rename("_reb_flag").reset_index(),
+            on=date_col,
+            how="left",
+        )
+        .assign(_rebalance_id=lambda d: d["_reb_flag"].cumsum())
+        [[date_col, "_rebalance_id"]]
+    )
+    out = out.merge(date_map, on=date_col, how="left")
+
+    # Within each (rebalance interval, ticker), mark if the ticker is *in* the interval:
+    # i.e., it has non-NA weights at the interval's first date.
+    # Using 'first' is safe because rows are sorted by date.
+    out["_is_member"] = out.groupby(["_rebalance_id", id_col])["_row_has_data"].transform("first")
+
+    # Mask out non-members inside each interval so they never get filled there
+    for col in weight_cols:
+        out[col] = out[col].where(out["_is_member"])
+
+    # Now forward fill only within each (rebalance interval, ticker)
+    for col in weight_cols:
+        out[col] = out.groupby(["_rebalance_id", id_col])[col].ffill()
+
+    # Clean up helpers
+    out.drop(columns=["_row_has_data", "_rebalance_id", "_is_member"], inplace=True)
+
+    return out
+ 
 # Backtest classes
 class AssetClass(str, Enum):
     EQUITY = "equity"
@@ -132,8 +207,11 @@ class Backtest(BaseModel):
         df = df_merged.copy()
         
         # Forward fill multiple columns within each group
-        cols = [i for i in list(df.columns) if i not in ['date','ticker','return']]
-        df[cols] = df.groupby(['ticker'])[cols].ffill()
+        # import pdb; pdb.set_trace()
+        df = smart_forward_fill_weights_optimized(df, weight_cols=['weight','weight_benchmark'])
+        # cols = [i for i in list(df.columns) if i not in ['date','ticker','return']]
+        # df[cols] = df.groupby(['ticker'])[cols].ffill()
+
         df.dropna(subset=['weight','weight_benchmark'], inplace=True)
 
         # Apply lag if specified

@@ -15,5 +15,5 @@ enabled = true
 include = ["src", "app_factors.py"]
 extraPaths = ["./src"]
 pythonPath = "python"
-typeCheckingMode = "basic"
+typeCheckingMode = "standard"
 useLibraryCodeForTypes = true
