@@ -381,18 +381,18 @@ def run_tracking_error_optimization() -> Dict:
             return None
         
         # Check date formats and alignment
-        st.info("Checking date alignment...")
+        # st.info("Checking date alignment...")
         
         # Convert turnover dates to datetime format to match other dataframes
         st.info("Converting turnover dates to datetime format...")
         try:
             # Convert turnover dates to datetime
             turnover_dates_datetime = [pd.to_datetime(d) for d in model_input.backtest.dates_turnover]
-            st.info(f"Converted turnover dates sample: {turnover_dates_datetime[:3]}")
+            # st.info(f"Converted turnover dates sample: {turnover_dates_datetime[:3]}")
             
             # Update the model_input with converted dates
             # model_input.backtest.dates_turnover = turnover_dates_datetime
-            st.success("Turnover dates converted to datetime format")
+            # st.success("Turnover dates converted to datetime format")
             
         except Exception as date_conv_error:
             st.error(f"Error converting turnover dates: {date_conv_error}")
@@ -417,8 +417,8 @@ def run_tracking_error_optimization() -> Dict:
         # Now use the converted turnover dates
         turnover_dates = set(str(d) for d in turnover_dates_datetime)
         
-        st.info(f"Exposure dates sample: {list(exposure_dates)[:5]}")
-        st.info(f"Turnover dates sample: {list(turnover_dates)[:5]}")
+        # st.info(f"Exposure dates sample: {list(exposure_dates)[:5]}")
+        # st.info(f"Turnover dates sample: {list(turnover_dates)[:5]}")
         
         # Check for common dates
         common_dates = exposure_dates.intersection(turnover_dates)
@@ -992,18 +992,19 @@ def render_tracking_error_results(results: Dict):
 def create_model_input() -> EquityFactorModelInput:
     """Create model input from UI selections"""
     # Convert string date to date object if needed
-    start_date_obj = st.session_state.start_date
+    start_date_obj = str(st.session_state.start_date)
     if isinstance(start_date_obj, str):
-        st.success(f"start_date 0 is string: {start_date_obj}")
+        st.success(f"start_date 00 is string: {start_date_obj}")
         start_date_obj = datetime.strptime(start_date_obj, "%Y-%m-%d").date()
     else:
-        st.success(f"start_date 0 NOT is string, it's {type(start_date_obj)}: {str(start_date_obj)}")
+        st.success(f"start_date 00 NOT is string, it's {type(start_date_obj)}: {str(start_date_obj)}")
 
     end_date_obj = st.session_state.end_date
     if isinstance(end_date_obj, str):
         end_date_obj = datetime.strptime(end_date_obj, "%Y-%m-%d").date()
     
     # Create the model input
+    # import pdb; pdb.set_trace()
     model_input = EquityFactorModelInput(
         params=ParamsConfig(
             aum=Decimal(str(st.session_state.aum)),
@@ -1015,7 +1016,9 @@ def create_model_input() -> EquityFactorModelInput:
             universe=Universe(st.session_state.universe),
             currency=Currency.USD,
             frequency=Frequency[st.session_state.frequency],
-            start_date=pd.to_datetime(str(st.session_state.start_date)).date(), #start_date_obj,
+            start_date=start_date_obj,
+            # start_date=str(st.session_state.start_date), #start_date_obj,
+            # start_date=pd.to_datetime(start_date_obj).date(), #start_date_obj,
             end_date=end_date_obj,
             concurrent_download=st.session_state.concurrent
         ),
@@ -1028,11 +1031,12 @@ def create_model_input() -> EquityFactorModelInput:
             base_path="../data/output"
         )
     )
-    
-    st.success(f"start_date 0: {model_input.backtest.start_date}")
+
+    model_input.backtest.start_date = start_date_obj
+    # st.success(f"start_date 01: {model_input.backtest.start_date}")
     # model_input.backtest.start_date = pd.to_datetime('2018-12-31').date()
     # st.success(f"start_date 1: {model_input.backtest.start_date}")
-    st.success(f"end_date 0: {model_input.backtest.end_date}")
+    # st.success(f"end_date 01: {model_input.backtest.end_date}")
     
     # Set up dates in the model
     set_model_input_dates_turnover(model_input)
@@ -1669,7 +1673,7 @@ with st.sidebar:
         start_date = st.date_input(
             "Start Date",
             # value=default_start,
-            value=datetime(2019, 12, 31).date(),
+            value=datetime(2017, 12, 31).date(),
             key="start_date"
         )
     with col2:

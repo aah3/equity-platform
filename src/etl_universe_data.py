@@ -15,7 +15,8 @@ from qFactor import (
     EquityFactorModelInput, ParamsConfig, BacktestConfig, RegimeConfig, OptimizationConfig, ExportConfig,
     RiskFactors, Universe, Currency, Frequency, EquityFactor, VolatilityType,
     SecurityMasterFactory, FactorFactory, get_rebalance_dates, generate_config_id,
-    set_model_input_start, set_model_input_dates_turnover, set_model_input_dates_daily
+    set_model_input_start, set_model_input_dates_turnover, set_model_input_dates_daily,
+    merge_weights_with_factor_loadings
 )
 
 from file_data_manager import (
@@ -128,6 +129,9 @@ def etl_universe_data(model_input, progress_callback=None):
             update_progress(current_step, total_steps, f"   Factor {i}/{len(factor_list)}: {factor_type}")
             factor = FactorFactory(factor_type=factor_type, model_input=model_input)
             df = factor.get_factor_data()
+            if df_benchmark_weights.shape[0]>0:
+                df = merge_weights_with_factor_loadings(df_benchmark_weights, df)
+                df = df[['date','factor_name','sid','value']]
             factor_eq = None
             if not df.empty:
                 factor_eq = EquityFactor(
@@ -239,10 +243,10 @@ if __name__ == "__main__":
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.NDX, # INDU, NDX
+            universe=Universe.INDU, # INDU, NDX, SPX
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
-            start='2017-12-31', # '2022-12-31',
+            start='2015-12-31', # '2022-12-31',
             portfolio_list=[],
             concurrent_download = False
         ),
@@ -252,7 +256,7 @@ if __name__ == "__main__":
             periods=10
         ),
         export=ExportConfig(
-            update_history=False, # True, False
+            update_history=True, # True, False
             base_path="./data/time_series",
             s3_config=None
         )
@@ -305,4 +309,3 @@ if __name__ == "__main__":
         factor_dict[factor_name] = mgr.load_factors(f"{identifier}_members_{factor_name}")
 
     print("Succesfully load data.")
-

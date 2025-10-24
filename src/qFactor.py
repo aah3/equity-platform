@@ -15,6 +15,8 @@ import numpy as np
 import yfinance as yf
 import time
 import warnings
+import urllib
+import urllib.request
 from functools import lru_cache
 
 import matplotlib.pyplot as plt
@@ -26,9 +28,88 @@ from utils import *
 
 from enum import Enum
 from decimal import Decimal
+import logging # Good practice to log errors
+
 
 from qOptimization import (PurePortfolioConstraints, PureFactorOptimizer)
 import qBacktest as bt
+
+# Helper functions: get index constituents
+
+# --- Configuration Map ---
+# This is the "best way" to generalize the function.
+# We map the ticker to the URL and the specific table index we need to scrape.
+INDEX_CONFIG = {
+    '^DJI': {
+        'url': 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average#Components', #'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average',
+        'table_index': 2 # The table of component stocks
+    },
+    '^GSPC': {
+        'url': 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', # 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
+        'table_index': 0 # The first table on the page is the components list
+    },
+    '^NDX': {
+        'url': 'https://en.wikipedia.org/wiki/Nasdaq-100#Components', # 'https://en.wikipedia.org/wiki/Nasdaq-100',
+        'table_index': 4 # The table titled "Components"
+    }
+    # You can easily add more indices here:
+    # '^FTSE': { 'url': '...', 'table_index': ... },
+}
+
+
+def get_index_constituents(ticker: str) -> pd.DataFrame:
+    """
+    Fetches the constituent stocks for a given index ticker from Wikipedia.
+
+    Args:
+        ticker: The index ticker symbol (e.g., '^DJI', '^GSPC', '^NDX').
+
+    Returns:
+        A pandas DataFrame with the constituent data, or an empty
+        DataFrame if the ticker is not found or an error occurs.
+    """
+    # 1. Look up the ticker in our configuration map
+    config = INDEX_CONFIG.get(ticker)
+
+    # 2. If ticker is not in our map, return an empty DataFrame
+    if not config:
+        logging.warning(f"Ticker '{ticker}' not configured. Returning empty DataFrame.")
+        return pd.DataFrame()
+
+    url_name = config['url']
+    table_idx = config['table_index']
+
+    try:
+        # 3. Create the request with a User-Agent to avoid 403 Forbidden error
+        req = urllib.request.Request(
+            url_name, 
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+
+        # 4. Open the request and pass the file-like response to pandas
+        with urllib.request.urlopen(req) as response:
+            # pd.read_html returns a list of *all* tables on the page
+            all_tables = pd.read_html(response)
+
+        # 5. Select the correct table using the index from our config
+        constituents_df = all_tables[table_idx]
+        
+        logging.info(f"Successfully fetched {len(constituents_df)} constituents for {ticker}.")
+        return constituents_df
+
+    except urllib.error.HTTPError as e:
+        # Handle web errors (e.g., 404 Not Found, 500 Server Error)
+        logging.error(f"HTTP Error for {ticker} at {url_name}: {e}")
+        return pd.DataFrame()
+    except IndexError:
+        # Handle if the page structure changed and our table_index is wrong
+        logging.error(f"Error: Table index {table_idx} not found for {ticker} at {url_name}.")
+        return pd.DataFrame()
+    except Exception as e:
+        # Handle any other unexpected errors
+        logging.error(f"An unexpected error occurred for {ticker}: {e}")
+        return pd.DataFrame()
+
 
 # Config ID function
 def default_json_encoder(o):
@@ -449,7 +530,7 @@ class BacktestConfig(BaseModel):
     )
     start_date: date = Field(
         # default= pd.Timestamp.now('US/Eastern').date(),
-        default = pd.to_datetime('2018-12-31').date(),
+        default = pd.to_datetime('2017-12-31').date(),
         alias='start',
         description="Backtest start date"
     )
@@ -723,9 +804,9 @@ class SecurityMasterBloomberg(BaseModel):
                 df_weights = pd.concat([df_weights, df])
             
             # Format dates and weights
-            df_weights = df_weights.set_index('date')
-            # df_weights.index = df_weights['date']
-            # df_weights.index.name = 'index'
+            # df_weights = df_weights.set_index('date')
+            df_weights.index = df_weights['date']
+            df_weights.index.name = 'index'
             # df_weights['date'] = df_weights['date'].astype(str)    
             # df_weights['date'] = df_weights['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)    
             df_weights['weight'] /= 100
@@ -944,8 +1025,35 @@ class SecurityMasterYahoo(BaseModel):
                 #     f"https://en.wikipedia.org/wiki/List_of_{ticker[1:].lower()}_companies"
                 # )[0]  # Select the first table, which usually holds the constituent list
                 if ticker == '^GSPC':
-                    url_name = "http://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-                    constituents_df = pd.read_html(url_name)[0] # TO DO: check if this is the correct table
+                    constituents_df = get_index_constituents(ticker)
+                        
+                    # url_name = "http://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+                    # # constituents_df = pd.read_html(url_name)[0] # TO DO: check if this is the correct table
+                    # req = urllib.request.Request(
+                    #     url_name, 
+                    #     headers={'User-Agent': 'Mozilla/5.0'}
+                    # )
+                    
+                    # # 2. Open the request and pass the FILE-LIKE RESPONSE to pandas
+                    # # We use a 'with' statement to ensure it's closed properly
+                    # with urllib.request.urlopen(req) as response:
+                    #     constituents_df_list = pd.read_html(response)
+
+                    # 3. Select the correct table from the list
+                    # (The components table is the second one on the page, index [1])
+                    # if constituents_df_list:
+                    #     constituents_df = constituents_df_list[0]
+                    if not constituents_df.empty:
+                        print(constituents_df.head())
+                        constituents_df.columns = [
+                            'ticker','name','sector','sub_industry','location','inclusion',
+                            'cik','founded']
+                        constituents_df.insert(0,'date',date)
+                        return constituents_df
+                    else:
+                        print("No tables found.")
+                        return pd.DataFrame()
+
                     constituents_df.columns = ['ticker','name','sector','sub_industry','location','inclusion',
                                                'cik','founded']
                     constituents_df.insert(0,'date',date)
@@ -954,44 +1062,129 @@ class SecurityMasterYahoo(BaseModel):
                     #     self.security_master = constituents_df.copy()
                     # return list(constituents_df['ticker'])
                 elif ticker == '^DJI':
-                    url_name = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average#Components"
-                    constituents_df = pd.read_html(url_name)[2]
-                    constituents_df.columns = ['name','exchange','ticker','sector','inclusion',
-                                               'notes','weight']
-                    constituents_df.insert(0,'date',date)
-                    return constituents_df
+                    # url_name = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average#Components"
+                    # # 1. Create the request object (same as before, to fix the 403 error)
+                    # req = urllib.request.Request(
+                    #     url_name, 
+                    #     headers={'User-Agent': 'Mozilla/5.0'}
+                    # )
+                    
+                    # 2. Open the request and pass the FILE-LIKE RESPONSE to pandas
+                    # We use a 'with' statement to ensure it's closed properly
+                    # with urllib.request.urlopen(req) as response:
+                    #     constituents_df_list = pd.read_html(response)
+
+                    # 3. Select the correct table from the list
+                    # (The components table is the third one on the page, index [2])
+                    # if constituents_df_list:
+                    #     constituents_df = constituents_df_list[2]
+                    constituents_df = get_index_constituents(ticker)
+                    if not constituents_df.empty:
+                        print(constituents_df.head())
+                        constituents_df.columns = [
+                            'name','exchange','ticker','sector','inclusion',
+                            'notes','weight']
+                        constituents_df.insert(0,'date',date)
+                        return constituents_df
+                    else:
+                        print("No tables found.")
+                        return pd.DataFrame()
+
+                    # constituents_df = pd.read_html(url_name)[2]
                     # if 'sector' in constituents_df.columns:
                     #     self.security_master = constituents_df.copy()
                     # return list(constituents_df['ticker'])
                 elif ticker == '^IXIC':
                     url_name = "http://en.wikipedia.org/wiki/Nasdaq-100#Components"
-                    constituents_df = pd.read_html(url_name)[4]
-                    constituents_df.columns = ['name','ticker','sector','sub_industry']
-                    constituents_df.insert(0,'date',date)
-                    return constituents_df
+                    # constituents_df = pd.read_html(url_name)[4]
+                    req = urllib.request.Request(
+                        url_name, 
+                        headers={'User-Agent': 'Mozilla/5.0'}
+                    )
+                    
+                    # 2. Open the request and pass the FILE-LIKE RESPONSE to pandas
+                    # We use a 'with' statement to ensure it's closed properly
+                    with urllib.request.urlopen(req) as response:
+                        constituents_df_list = pd.read_html(response)
+
+                    # 3. Select the correct table from the list
+                    # (The components table is the fifth one on the page, index [4])
+                    if constituents_df_list:
+                        constituents_df = constituents_df_list[4]
+                        print(constituents_df.head())
+                        # constituents_df.columns = ['name','ticker','sector','sub_industry']
+                        constituents_df.columns = ['ticker','name','sector','sub_industry']
+                        constituents_df.insert(0,'date',date)
+                        return constituents_df
+                    else:
+                        print("No tables found.")
+                        return pd.DataFrame()
+
+                    # constituents_df.columns = ['name','ticker','sector','sub_industry']
+                    # constituents_df.insert(0,'date',date)
+                    # return constituents_df
                     # if 'sector' in constituents_df.columns:
                     #     self.security_master = constituents_df.copy()
                     # return list(constituents_df['ticker'])
                 elif ticker == '^NDX':
-                    url_name = "http://en.wikipedia.org/wiki/Nasdaq-100#Components"
-                    constituents_df = pd.read_html(url_name)[4]
-                    constituents_df.columns = ['ticker','name','sector','sub_industry']
-                    # constituents_df.columns = ['name','ticker','sector','sub_industry']
-                    constituents_df.insert(0,'date',date)
-                    return constituents_df
-                    # if 'sector' in constituents_df.columns:
-                    #     self.security_master = constituents_df.copy()
-                    # return list(constituents_df['ticker'])
+                    # url_name = "http://en.wikipedia.org/wiki/Nasdaq-100#Components"
+                    # constituents_df = pd.read_html(url_name)[4]
+                    # req = urllib.request.Request(
+                    #     url_name, 
+                    #     headers={'User-Agent': 'Mozilla/5.0'}
+                    # )
+                    
+                    # # 2. Open the request and pass the FILE-LIKE RESPONSE to pandas
+                    # # We use a 'with' statement to ensure it's closed properly
+                    # with urllib.request.urlopen(req) as response:
+                    #     constituents_df_list = pd.read_html(response)
+
+                    # # 3. Select the correct table from the list
+                    # # (The components table is the fifth one on the page, index [4])
+                    # if constituents_df_list:
+                    #     constituents_df = constituents_df_list[4]
+                    constituents_df = get_index_constituents(ticker)
+                    if not constituents_df.empty:
+                        print(constituents_df.head())
+                        # constituents_df.columns = ['name','ticker','sector','sub_industry']
+                        constituents_df.columns = ['ticker','name','sector','sub_industry']
+                        constituents_df.insert(0,'date',date)
+                        return constituents_df
+                    else:
+                        print("No tables found.")
+                        return pd.DataFrame()
                 elif ticker == '^SP600':
                     url_name = "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies"
-                    constituents_df = pd.read_html(url_name)[0]
-                    constituents_df.columns = ['ticker','name','sector','sub_industry','location',
-                                               'sec_filings','cik']
-                    constituents_df.insert(0,'date',date)
-                    return constituents_df
-                    # if 'sector' in constituents_df.columns:
-                    #     self.security_master = constituents_df.copy()
-                    # return list(constituents_df['ticker'])
+                    req = urllib.request.Request(
+                        url_name, 
+                        headers={'User-Agent': 'Mozilla/5.0'}
+                    )
+                    
+                    # 2. Open the request and pass the FILE-LIKE RESPONSE to pandas
+                    # We use a 'with' statement to ensure it's closed properly
+                    with urllib.request.urlopen(req) as response:
+                        constituents_df_list = pd.read_html(response)
+
+                    # 3. Select the correct table from the list
+                    # (The components table is the first one on the page, index [0])
+                    if constituents_df_list:
+                        constituents_df = constituents_df_list[0]
+                        print(constituents_df.head())
+                        # constituents_df.columns = ['name','ticker','sector','sub_industry']
+                        constituents_df.columns = [
+                            'ticker','name','sector','sub_industry','location',
+                            'sec_filings','cik']
+                        constituents_df.insert(0,'date',date)
+                        return constituents_df
+                    else:
+                        print("No tables found.")
+                        return pd.DataFrame()
+
+                    # constituents_df = pd.read_html(url_name)[0]
+                    # constituents_df.columns = ['ticker','name','sector','sub_industry','location',
+                    #                            'sec_filings','cik']
+                    # constituents_df.insert(0,'date',date)
+                    # return constituents_df
             else:
                 return pd.DataFrame() # []
 
@@ -1054,8 +1247,8 @@ class SecurityMasterYahoo(BaseModel):
         if not df_weights.empty:
             if 'sid' not in df_weights.columns:
                 df_weights['sid'] = df_weights['ticker']
-            df_weights = df_weights.set_index('date')
-            # df_weights.index = df_weights['date']
+            # df_weights = df_weights.set_index('date')
+            df_weights.index = df_weights['date']
             df_weights.index.name = 'index'
             df_weights.rename(columns={'wgt':'weight','weight':'wgt'}, inplace=True)
             # TO DO: CHECK DATAFRAME COLUMNS
@@ -1585,8 +1778,8 @@ class BQLFactor(BaseModel):
             except:
                 pass # print("BQL factor date in date format")
 
-            # df.index = df['date']
-            df = df.set_index('date')
+            df.index = df['date']
+            # df = df.set_index('date')
             df.index.name = 'index' 
             return df
         except Exception as e:
@@ -1961,8 +2154,8 @@ class YahooFactor(BaseModel):
                         df['date'] = df['date'].dt.date
                     except:
                         pass # print("Yahoo factor date in date format")
-                    # df.index = df['date']
-                    df = df.set_index('date')
+                    df.index = df['date']
+                    # df = df.set_index('date')
                     df.index.name = 'index'
             return df
             
@@ -2060,8 +2253,8 @@ class YahooFactor(BaseModel):
         df.drop_duplicates(inplace=True)
         df.sort_values(['sid', 'date'], inplace=True)
         df.reset_index(drop=True, inplace=True)
-        # df.index = pd.to_datetime(df.date)
-        df = df.set_index('date')
+        df.index = pd.to_datetime(df.date)
+        # df = df.set_index('date')
         df.index.name = 'index'
         
         return df
@@ -3012,15 +3205,18 @@ class EquityFactor(BaseModel):
             # df = df.groupby([groupby, 'factor_name']).apply(normalize_group).reset_index(drop=True)
             df = df.groupby([groupby,'factor_name'], as_index=True).apply(
                 normalize_group, include_groups=False).reset_index(drop=False)
-            df.drop(columns=['index'], inplace=True)
+            if 'index' in df.columns:
+                df.drop(columns=['index'], inplace=True)
+            if 'level_2' in df.columns:
+                df.drop(columns=['level_2'], inplace=True)
             df = df.sort_values(['sid','date'])
         else:
             factor_name = df.factor_name.unique()[0]
             df = df.groupby('factor_name').apply(normalize_group, include_groups=False).reset_index(drop=True)
             df.insert(1,'factor_name',factor_name)
 
-        # df.index = df.date
-        df = df.set_index('date')
+        df.index = df.date
+        # df = df.set_index('date')
         df.index.name = None
         return df
     
@@ -3670,16 +3866,21 @@ def merge_weights_with_factor_loadings(
          .reset_index(drop=True)
     )
 
+    df_weights_final['date'] = pd.to_datetime(df_weights_final['date']).dt.date
+
     return df_weights_final
 
 # Example usage:
 if __name__ == "__main__":
+    # Configure logging to see outputs
+    logging.basicConfig(level=logging.INFO)
+
     from file_data_manager import (
         FileConfig, FileDataManager 
         )
     # test_yahooFactor()
     
-    update_history = False
+    update_history = False # True | False
 
     cfg = FileConfig()
     mgr = FileDataManager(cfg)
@@ -3866,7 +4067,8 @@ if __name__ == "__main__":
             # factor_data[factor_name] = factor.get_factor_data()
             factor_df = factor.get_factor_data()
 
-            factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+            if df_benchmark_weights.shape[0]>0:
+                factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
 
             # Create EquityFactor instance
             factor_eq = EquityFactor(
@@ -3941,7 +4143,10 @@ if __name__ == "__main__":
         for factor_type in factor_list: # [:1]
             print(f"Running model for factor: {factor_type}")
             factor_df = factor_data_dict.get(factor_type)
-            factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+
+
+            # if df_benchmark_weights.shape[0]>0:
+            #     factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
 
             # Create EquityFactor instance
             factor_eq = EquityFactor(

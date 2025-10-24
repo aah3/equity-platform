@@ -449,9 +449,9 @@ class TrackingErrorOptimizer(BaseModel):
             try:
                 with redirect_stdout(solver_output), redirect_stderr(solver_output):
                     if self.use_integer_constraints:
-                        prob.solve(solver=cp.SCIPY, verbose=True)
+                        prob.solve(solver=cp.SCIPY, verbose=False)
                     else:
-                        prob.solve(solver=cp.CLARABEL, verbose=True)
+                        prob.solve(solver=cp.CLARABEL, verbose=False)
                 
                 solver_log = solver_output.getvalue()
                 if solver_log:
