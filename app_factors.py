@@ -254,6 +254,7 @@ def run_factor_analysis() -> Dict:
 
             # NEW: merge benchmark weights with factor_df
             factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+            factor_df = factor_df[['date','factor_name','sid','value']]
 
             # Create EquityFactor instance
             factor = EquityFactor(
@@ -422,14 +423,14 @@ def run_tracking_error_optimization() -> Dict:
         
         # Check for common dates
         common_dates = exposure_dates.intersection(turnover_dates)
-        st.info(f"Common dates between exposures and turnover: {len(common_dates)}")
+        # st.info(f"Common dates between exposures and turnover: {len(common_dates)}")
         
         if len(common_dates) == 0:
             st.warning("No common dates found between exposures and turnover dates!")
             st.warning("This might cause the 'sid' KeyError")
         
         # Validate date format consistency before optimization
-        st.info("Validating date format consistency...")
+        # st.info("Validating date format consistency...")
         date_dtypes = {}
         if not df_exposures.empty and 'date' in df_exposures.columns:
             date_dtypes['df_exposures'] = str(df_exposures['date'].dtype)
@@ -451,37 +452,37 @@ def run_tracking_error_optimization() -> Dict:
         # Additional debugging: Check first date filtering
         if model_input.backtest.dates_turnover:
             first_date = model_input.backtest.dates_turnover[0]
-            st.info(f"Testing first date filtering: {first_date}")
+            # st.info(f"Testing first date filtering: {first_date}")
             # st.info(f"First date type: {type(first_date)}")
             
             # Test the filtering logic that's used in the optimization
             # Since both dates are now datetime objects, we can compare them directly
             test_exposures = df_exposures[df_exposures['date'] == first_date].copy()
-            st.info(f"Exposures for first date {first_date}: {test_exposures.shape[0]} rows")
+            # st.info(f"Exposures for first date {first_date}: {test_exposures.shape[0]} rows")
             
             if test_exposures.empty:
                 st.warning(f"No exposures found for date {first_date}")
                 st.warning("This will cause the 'sid' KeyError in the optimization loop")
                 
                 # Try alternative filtering methods
-                st.info("Trying alternative date filtering methods...")
+                # st.info("Trying alternative date filtering methods...")
                 
                 # Method 1: String comparison
                 test_exposures_str = df_exposures[df_exposures['date'].astype(str) == str(first_date)].copy()
-                st.info(f"String comparison result: {test_exposures_str.shape[0]} rows")
+                # st.info(f"String comparison result: {test_exposures_str.shape[0]} rows")
                 
                 # Method 2: Date-only comparison
                 test_exposures_date = df_exposures[df_exposures['date'].dt.date == first_date.date()].copy()
-                st.info(f"Date-only comparison result: {test_exposures_date.shape[0]} rows")
+                # st.info(f"Date-only comparison result: {test_exposures_date.shape[0]} rows")
                 
                 if test_exposures_date.shape[0] > 0:
                     st.success("Found exposures using date-only comparison!")
                     test_exposures = test_exposures_date
             else:
                 st.success(f"Found exposures for date {first_date}")
-                st.info(f"Sample exposure columns: {list(test_exposures.columns)}")
-                if 'sid' in test_exposures.columns:
-                    st.info(f"Sample sids: {test_exposures['sid'].head().tolist()}")
+                # st.info(f"Sample exposure columns: {list(test_exposures.columns)}")
+                # if 'sid' in test_exposures.columns:
+                    # st.info(f"Sample sids: {test_exposures['sid'].head().tolist()}")
         
         # Run optimization with output capture
         st.info("Starting optimization... This may take a few minutes.")
@@ -744,6 +745,35 @@ def run_pure_factor_optimization() -> Dict:
             index=['date','sid'], columns='variable', values='exposure').reset_index(drop=False)
         df_exposures.fillna(0., inplace=True)
 
+        # Ensure date format consistency in exposures
+        # Convert to date objects (not datetime) so that when optimizer converts to string, 
+        # it matches our YYYY-MM-DD format
+        if 'date' in df_exposures.columns:
+            df_exposures['date'] = pd.to_datetime(df_exposures['date']).dt.date
+        
+        # Ensure dates_turnover is a list that can be converted to strings by the optimizer
+        # Convert to datetime if needed, optimizer will handle string conversion
+        if model_input.backtest.dates_turnover:
+            dates_turnover = [pd.to_datetime(d).date() if not isinstance(d, date) else d 
+                            for d in model_input.backtest.dates_turnover]
+        else:
+            st.error("No turnover dates found in model input")
+            return None
+        
+        # Prepare sector dummies (empty DataFrame if sector neutral is not enabled)
+        sector_dummies = pd.DataFrame()
+        if model_input.params.sector_neutral:
+            try:
+                # Try to load sector dummies from security master if available
+                security_master = SecurityMasterFactory(model_input=model_input)
+                security_master.df_price = mgr.load_prices(identifier+'_members')
+                if security_master.meta_data is None or security_master.meta_data.empty:
+                    security_master.get_meta_data(sector_classification=model_input.params.sector_classification)
+                sector_dummies = security_master.get_sector_dummies(dummy_name='sector')
+            except Exception as e:
+                st.warning(f"Could not load sector dummies: {str(e)}. Continuing without sector neutralization.")
+                sector_dummies = pd.DataFrame()
+
         # Initialize containers for results
         df_pure_return = pd.DataFrame()
         df_pure_portfolio = pd.DataFrame()
@@ -769,14 +799,65 @@ def run_pure_factor_optimization() -> Dict:
                 parallel_processing=False
             )
 
-            # Run optimization
+            # Run optimization - now includes sector_dummies parameter
+            # Convert dates_turnover to strings in YYYY-MM-DD format for consistent matching
+            # The optimizer converts exposure dates to strings, so we need matching format
+            dates_str = []
+            for d in dates_turnover:
+                if isinstance(d, str):
+                    # Already a string, try to parse and reformat to ensure consistency
+                    d_parsed = pd.to_datetime(d)
+                    dates_str.append(d_parsed.strftime('%Y-%m-%d'))
+                elif isinstance(d, date):
+                    dates_str.append(d.strftime('%Y-%m-%d'))
+                else:
+                    # datetime or other date-like object
+                    d_parsed = pd.to_datetime(d)
+                    dates_str.append(d_parsed.strftime('%Y-%m-%d'))
+            
             results = optimizer_pure.optimize(
-                df_ret_wide, 
-                df_exposures, 
-                model_input.backtest.dates_turnover
+                returns=df_ret_wide, 
+                exposures=df_exposures, 
+                dates=dates_str,
+                sector_dummies=sector_dummies,
+                add_turn_over=False
             )
+            
+            # Get weights data and ensure 'factor' column exists (rename from 'pfactor' if needed)
             df_portfolio = results.get('weights_data')
-            df_pure_portfolio = pd.concat([df_pure_portfolio, df_portfolio])
+            if df_portfolio is not None and not df_portfolio.empty:
+                # The optimizer returns weights_data with date as index (named 'index')
+                # but also keeps 'date' as a column. Reset index to ensure date is a column.
+                if df_portfolio.index.name == 'index' or isinstance(df_portfolio.index, (pd.DatetimeIndex, pd.Index)):
+                    # Check if date column exists - if not, use index
+                    if 'date' not in df_portfolio.columns:
+                        df_portfolio = df_portfolio.reset_index()
+                        # The reset index might be named 'index', rename it to 'date' if needed
+                        if 'index' in df_portfolio.columns and 'date' not in df_portfolio.columns:
+                            df_portfolio = df_portfolio.rename(columns={'index': 'date'})
+                    else:
+                        # Date column exists, but index might also contain dates - reset to avoid confusion
+                        df_portfolio = df_portfolio.reset_index(drop=True)
+                
+                # Rename 'pfactor' to 'factor' if it exists, otherwise add 'factor' column
+                if 'pfactor' in df_portfolio.columns:
+                    df_portfolio = df_portfolio.rename(columns={'pfactor': 'factor'})
+                elif 'factor' not in df_portfolio.columns:
+                    df_portfolio['factor'] = factor
+                
+                # Ensure date is in proper format and is a column (not index)
+                if 'date' in df_portfolio.columns:
+                    df_portfolio['date'] = pd.to_datetime(df_portfolio['date'])
+                else:
+                    st.error(f"No date column found in portfolio data for factor {factor}. Available columns: {list(df_portfolio.columns)}")
+                    continue
+                
+                # Ensure we have required columns
+                if 'sid' not in df_portfolio.columns or 'weight' not in df_portfolio.columns:
+                    st.error(f"Missing required columns (sid, weight) in portfolio data for factor {factor}")
+                    continue
+                
+                df_pure_portfolio = pd.concat([df_pure_portfolio, df_portfolio], ignore_index=True)
 
             # Run backtest for this factor
             config = bt.BacktestConfig(
@@ -788,18 +869,54 @@ def run_pure_factor_optimization() -> Dict:
 
             backtest = bt.Backtest(config=config)
             df_portfolio_bt = df_portfolio.copy()
-            df_portfolio_bt.rename(columns={'sid':'ticker', 'weight':'weight'}, inplace=True)
+            
+            # Ensure required columns exist for backtest
+            if 'ticker' not in df_portfolio_bt.columns and 'sid' in df_portfolio_bt.columns:
+                df_portfolio_bt['ticker'] = df_portfolio_bt['sid']
+            if 'weight' not in df_portfolio_bt.columns:
+                st.error(f"No weight column found in portfolio data for factor {factor}")
+                continue
+                
             df_returns = df_ret_long.copy()
-            df_returns.rename(columns={'sid':'ticker'}, inplace=True)
+            if 'ticker' not in df_returns.columns and 'sid' in df_returns.columns:
+                df_returns['ticker'] = df_returns['sid']
             
             results_bt = backtest.run_backtest(df_returns, df_portfolio_bt, plot=False)
             df_ret_opt = backtest.df_pnl.copy()
+            
+            # Backtest returns df_pnl with date as index and factor column
+            # Reset index to make date a column for easier concatenation
+            if df_ret_opt.index.name == 'date' or isinstance(df_ret_opt.index, pd.DatetimeIndex):
+                df_ret_opt = df_ret_opt.reset_index()
+                if 'date' not in df_ret_opt.columns:
+                    # If index was named differently, rename it
+                    df_ret_opt = df_ret_opt.rename(columns={df_ret_opt.columns[0]: 'date'})
+            
+            # Ensure factor column exists in backtest results
+            if 'factor' not in df_ret_opt.columns:
+                df_ret_opt['factor'] = factor
+            
+            # Ensure date is datetime
+            if 'date' in df_ret_opt.columns:
+                df_ret_opt['date'] = pd.to_datetime(df_ret_opt['date'])
                 
-            df_pure_return = pd.concat([df_pure_return, df_ret_opt])
+            df_pure_return = pd.concat([df_pure_return, df_ret_opt], ignore_index=True)
 
         # Store results in session state
-        df_pure_return_wide = df_pure_return[['factor','return_opt']].pivot(
-            columns='factor', values='return_opt')
+        if not df_pure_return.empty and 'factor' in df_pure_return.columns and 'return_opt' in df_pure_return.columns:
+            # Pivot to wide format: date as index, factors as columns
+            df_pure_return_wide = df_pure_return.pivot_table(
+                index='date', 
+                columns='factor', 
+                values='return_opt',
+                aggfunc='first'  # In case of duplicates, take first
+            )
+            # Ensure index is datetime
+            if not isinstance(df_pure_return_wide.index, pd.DatetimeIndex):
+                df_pure_return_wide.index = pd.to_datetime(df_pure_return_wide.index)
+        else:
+            st.warning("No returns data generated from backtests")
+            df_pure_return_wide = pd.DataFrame()
         
         st.session_state.pure_factor_returns = df_pure_return_wide
         st.session_state.df_pure_portfolio = df_pure_portfolio
@@ -816,7 +933,10 @@ def run_pure_factor_optimization() -> Dict:
         return results
         
     except Exception as e:
+        import traceback
         st.error(f"Error in pure factor optimization: {str(e)}")
+        with st.expander("Error Details"):
+            st.code(traceback.format_exc())
         return None
 
 
@@ -2159,11 +2279,22 @@ with tab3:
             # Add factor-specific portfolio if a specific factor is selected
             if selected_factor_pure != "All Factors":
                 factor_name = selected_factor_pure.lower()
-                factor_portfolio = st.session_state.df_pure_portfolio[
-                    st.session_state.df_pure_portfolio['factor'] == factor_name
-                ]
-                if not factor_portfolio.empty:
-                    download_data[f"{factor_name}_portfolio"] = factor_portfolio.sort_values(['date','weight'])
+                # Check which factor column exists ('factor' or 'pfactor')
+                factor_col = None
+                if 'factor' in st.session_state.df_pure_portfolio.columns:
+                    factor_col = 'factor'
+                elif 'pfactor' in st.session_state.df_pure_portfolio.columns:
+                    factor_col = 'pfactor'
+                else:
+                    st.warning("No 'factor' or 'pfactor' column found in portfolio data")
+                    factor_col = None
+                
+                if factor_col:
+                    factor_portfolio = st.session_state.df_pure_portfolio[
+                        st.session_state.df_pure_portfolio[factor_col] == factor_name
+                    ]
+                    if not factor_portfolio.empty:
+                        download_data[f"{factor_name}_portfolio"] = factor_portfolio.sort_values(['date','weight'])
             
             render_download_section(download_data, "Download Pure Factor Data", "pure_portfolios")
         
@@ -2278,11 +2409,26 @@ with tab3:
             
             # Portfolio holdings
             st.subheader("Portfolio Holdings")
-            if st.session_state.df_pure_portfolio is not None:
-                # Filter portfolio data for selected factor
-                factor_portfolio = st.session_state.df_pure_portfolio[
-                    st.session_state.df_pure_portfolio['factor'] == selected_factor_pure
-                ]
+            if st.session_state.df_pure_portfolio is not None and not st.session_state.df_pure_portfolio.empty:
+                # Check which factor column exists ('factor' or 'pfactor')
+                factor_col = None
+                if 'factor' in st.session_state.df_pure_portfolio.columns:
+                    factor_col = 'factor'
+                elif 'pfactor' in st.session_state.df_pure_portfolio.columns:
+                    factor_col = 'pfactor'
+                else:
+                    st.error("No 'factor' or 'pfactor' column found in portfolio data. Available columns: " + 
+                            str(list(st.session_state.df_pure_portfolio.columns)))
+                    factor_col = None
+                
+                if factor_col:
+                    # Filter portfolio data for selected factor (convert to lowercase for comparison)
+                    selected_factor_lower = selected_factor_pure.lower()
+                    factor_portfolio = st.session_state.df_pure_portfolio[
+                        st.session_state.df_pure_portfolio[factor_col].str.lower() == selected_factor_lower
+                    ]
+                else:
+                    factor_portfolio = pd.DataFrame()
                 
                 if not factor_portfolio.empty:
                     # Get latest holdings

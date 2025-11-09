@@ -2,7 +2,8 @@
 # This file would contain the actual implementation
 
 # Utils 
-from typing import List, Union, Optional
+from typing import List, Union, Dict, Iterable, Literal, Optional, Tuple
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from datetime import datetime as dtime
 from datetime import timedelta
 from time import sleep
@@ -17,6 +18,230 @@ import datetime
 # set up the BQL API instance to query Bloomberg data
 # import bql
 # bq = bql.Service(preferences={'currencyCheck':'when_available'})
+
+FreqAlias = Literal["daily", "weekly", "monthly", "yearly"]
+ResampleCode = Literal["B", "W-FRI", "ME", "YE"]
+
+def _compound(r: pd.Series) -> float:
+    """Compound simple returns (ignoring NaNs)."""
+    if r.dropna().empty:
+        return np.nan
+    return float((1.0 + r.dropna()).prod() - 1.0)
+
+def _to_resample_code(freq: FreqAlias) -> ResampleCode:
+    return {
+        "daily": "B",       # Business daily
+        "weekly": "W-FRI",  # ISO-like: end week on Friday (change if needed)
+        "monthly": "ME",
+        "yearly": "YE",
+    }[freq]
+
+class FactorReturnAggregator(BaseModel):
+    """
+    Aggregates factor returns and computes stats.
+
+    Expects a wide DataFrame:
+        index: DatetimeIndex (daily or business-daily)
+        columns: factor names (numeric returns, e.g., 0.002 = 0.2%)
+    """
+    data: pd.DataFrame = Field(..., description="Wide daily factor-return DataFrame.")
+    trading_days_per_year: int = Field(252, ge=1)
+    # Optional: enforce week ending day, e.g. 'W-FRI' (default in mapping above).
+    weekly_anchor: Literal["W-FRI", "W-THU", "W-WED", "W-TUE", "W-MON"] = "W-FRI"
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # -------------------- Validators -------------------- #
+    @field_validator("data", mode="before")
+    @classmethod
+    def _validate_dataframe(cls, v: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(v, pd.DataFrame):
+            raise TypeError("`data` must be a pandas DataFrame.")
+        if v.index is None or not isinstance(v.index, pd.Index):
+            raise ValueError("`data` must have an index.")
+        # Try to coerce index to datetime if not already
+        if not isinstance(v.index, pd.DatetimeIndex):
+            try:
+                v = v.copy()
+                v.index = pd.to_datetime(v.index)
+            except Exception as e:
+                raise ValueError(
+                    "`data` index must be DatetimeIndex or coercible to datetime."
+                ) from e
+        if v.shape[1] == 0:
+            raise ValueError("`data` must have at least one factor column.")
+        # Ensure all columns are numeric
+        non_numeric = [c for c in v.columns if not pd.api.types.is_numeric_dtype(v[c])]
+        if non_numeric:
+            raise TypeError(f"All factor columns must be numeric. Non-numeric: {non_numeric}")
+        return v.sort_index()
+
+    @field_validator("weekly_anchor")
+    @classmethod
+    def _validate_weekly_anchor(cls, v: str) -> str:
+        return v
+
+    # -------------------- Public API -------------------- #
+    def aggregate(
+        self,
+        freq: FreqAlias,
+        min_periods: int = 1,
+    ) -> pd.DataFrame:
+        """
+        Aggregate returns by compounding over the given frequency.
+
+        Parameters
+        ----------
+        freq : {'daily','weekly','monthly','yearly'}
+        min_periods : minimum non-NA observations in a period to compute a return
+
+        Returns
+        -------
+        DataFrame with compounded returns at the chosen frequency.
+        """
+        if freq == "daily":
+            # Already daily; optionally ensure business-daily frequency
+            df = self.data.asfreq("B")
+            return df
+
+        rule = _to_resample_code(freq)
+        if freq == "weekly":
+            rule = self.weekly_anchor  # override default if user customized
+
+        # resample then compound within each period
+        out = self.data.resample(rule).apply(_compound)
+        # Optionally drop periods with insufficient observations
+        if min_periods > 1:
+            counts = self.data.resample(rule).count()
+            out = out.where(counts >= min_periods)
+        return out
+
+    def aggregate_weekly(self, min_periods: int = 1) -> pd.DataFrame:
+        return self.aggregate("weekly", min_periods=min_periods)
+
+    def aggregate_monthly(self, min_periods: int = 1) -> pd.DataFrame:
+        return self.aggregate("monthly", min_periods=min_periods)
+
+    def aggregate_yearly(self, min_periods: int = 1) -> pd.DataFrame:
+        return self.aggregate("yearly", min_periods=min_periods)
+
+    def summary_stats(
+        self,
+        freq: FreqAlias = "daily",
+        risk_free_rate_annual: float = 0.0,
+    ) -> pd.DataFrame:
+        """
+        Compute per-factor summary statistics at the selected frequency.
+
+        Stats are computed from the series at that frequency:
+        - mean, vol, skew, kurtosis
+        - annualized return & volatility
+        - Sharpe (annualized)
+        - hit rate (% positive)
+        - max drawdown (from compounded series)
+        - count (obs)
+
+        Parameters
+        ----------
+        freq : aggregation level for stats ('daily','weekly','monthly','yearly')
+        risk_free_rate_annual : annual risk-free rate (e.g. 0.02 for 2%)
+
+        Returns
+        -------
+        DataFrame indexed by factor with statistics as columns.
+        """
+        df = self.aggregate(freq)
+
+        # infer periods per year
+        periods_per_year = {
+            "daily": self.trading_days_per_year,
+            "weekly": 52,      # anchored weeks
+            "monthly": 12,
+            "yearly": 1,
+        }[freq]
+
+        # risk-free per-period
+        rf_per_period = (1 + risk_free_rate_annual) ** (1 / periods_per_year) - 1
+
+        stats: Dict[str, Dict[str, float]] = {}
+        for col in df.columns:
+            r = df[col].dropna()
+            if r.empty:
+                # Fill with NaNs if there are no observations
+                stats[col] = {k: np.nan for k in [
+                    "mean", "vol", "skew", "kurtosis", "annual_return",
+                    "annual_vol", "sharpe", "hit_rate", "max_drawdown", "count"
+                ]}
+                continue
+
+            mean = float(r.mean())
+            vol = float(r.std(ddof=1))
+            skew = float(r.skew())
+            kurt = float(r.kurtosis())
+            # Annualization
+            ann_ret = float((1 + mean) ** periods_per_year - 1)
+            ann_vol = float(vol * np.sqrt(periods_per_year))
+            # Excess mean per period, then annualize Sharpe using ann_vol
+            excess_per_period = mean - rf_per_period
+            sharpe = np.nan
+            if ann_vol > 0:
+                sharpe = (excess_per_period * periods_per_year) / ann_vol
+
+            # Hit rate
+            hit_rate = float((r > 0).mean())
+
+            # Max drawdown from compounded equity curve
+            eq = (1.0 + r).cumprod()
+            peak = eq.cummax()
+            dd = (eq / peak) - 1.0
+            mdd = float(dd.min())
+
+            stats[col] = {
+                "mean": mean,
+                "vol": vol,
+                "skew": skew,
+                "kurtosis": kurt,
+                "annual_return": ann_ret,
+                "annual_vol": ann_vol,
+                "sharpe": sharpe,
+                "hit_rate": hit_rate,
+                "max_drawdown": mdd,
+                "count": float(r.shape[0]),
+            }
+
+        out = pd.DataFrame(stats).T[
+            ["count", "mean", "vol", "skew", "kurtosis",
+             "annual_return", "annual_vol", "sharpe", "hit_rate", "max_drawdown"]
+        ]
+        return out.sort_index()
+
+    # -------------------- Convenience helpers -------------------- #
+    def stats_daily(self, rf_annual: float = 0.0) -> pd.DataFrame:
+        return self.summary_stats(freq="daily", risk_free_rate_annual=rf_annual)
+
+    def stats_weekly(self, rf_annual: float = 0.0) -> pd.DataFrame:
+        return self.summary_stats(freq="weekly", risk_free_rate_annual=rf_annual)
+
+    def stats_monthly(self, rf_annual: float = 0.0) -> pd.DataFrame:
+        return self.summary_stats(freq="monthly", risk_free_rate_annual=rf_annual)
+
+    def stats_yearly(self, rf_annual: float = 0.0) -> pd.DataFrame:
+        return self.summary_stats(freq="yearly", risk_free_rate_annual=rf_annual)
+        
+def clean_list_items(input_list):
+    import re
+    cleaned_list = []
+    for item in input_list:
+        # Remove unwanted characters: &, ,, ...
+        item = re.sub(r'&|,|\.{2,}', '', item)
+        # Replace multiple spaces with a single space
+        item = re.sub(r'\s+', ' ', item)
+        # Strip leading/trailing spaces
+        item = item.strip()
+        # Replace space with underscore and convert to lowercase
+        item = item.replace(' ', '_').lower()
+        cleaned_list.append(item)
+    return cleaned_list
 
 def is_dst(dt=None, timezone="UTC"):
     # daylight savings helper function

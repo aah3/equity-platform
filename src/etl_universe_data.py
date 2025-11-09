@@ -59,12 +59,55 @@ def etl_universe_data(model_input, progress_callback=None):
     total_steps = 7
     current_step = 0
     
+    cfg = FileConfig()
+    mgr = FileDataManager(cfg)
+    
+    # If incremental update, check all data files and use earliest last date
+    if not update_history:
+        try:
+            file_sources = [
+                (mgr.load_prices, identifier+'_members', 'member prices'),
+                (mgr.load_prices, identifier, 'benchmark prices'),
+                (mgr.load_benchmark_weights, identifier, 'benchmark weights'),
+                (mgr.load_returns, identifier+'_members', 'member returns'),
+                (mgr.load_exposures, identifier+'_members', 'exposures')
+            ]
+            
+            last_dates = []
+            for load_func, file_id, desc in file_sources:
+                try:
+                    df = load_func(file_id)
+                    if df is not None and not df.empty and 'date' in df.columns:
+                        max_date = pd.to_datetime(df['date']).max()
+                        last_dates.append(max_date)
+                except Exception as e:
+                    logger.warning(f"Could not load {desc}: {e}")
+                    continue
+            
+            if last_dates:
+                # Find the minimum of all max dates (the earliest updated file)
+                last_date = min(last_dates)
+                update_progress(current_step, total_steps, 
+                               f"📅 Incremental update detected. Earliest last date: {last_date}")
+                # Set start date to the earliest last date minus 3 days for safety
+                model_input.backtest.start_date = (pd.to_datetime(last_date) + pd.Timedelta(days=-3)).date()
+                
+                # Update portfolio turnover dates
+                set_model_input_dates_turnover(model_input)
+
+                # Update daily business dates
+                set_model_input_dates_daily(model_input)
+
+                update_progress(current_step, total_steps, 
+                               f"📅 Adjusted start date to: {model_input.backtest.start_date}")
+        except Exception as e:
+            logger.warning(f"Error checking existing data, using configured start_date: {e}")
+            update_progress(current_step, total_steps, 
+                           f"⚠️ Could not determine incremental date, using configured start date", "warning")
+    
     update_progress(current_step, total_steps, f"🚀 Starting ETL process for {identifier}")
     update_progress(current_step, total_steps, f"📅 Update mode: {'FULL HISTORY' if update_history else 'INCREMENTAL'}")
     update_progress(current_step, total_steps, f"📊 Date range: {model_input.backtest.start_date} to {model_input.backtest.end_date}")
-    
-    cfg = FileConfig()
-    mgr = FileDataManager(cfg)
     
     if model_input.backtest.start_date < datetime.today().date()+pd.Timedelta(days=-1):
         current_step += 1
@@ -243,10 +286,10 @@ if __name__ == "__main__":
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.INDU, # INDU, NDX, SPX
+            universe=Universe.SPX, # INDU, NDX, SPX
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
-            start='2015-12-31', # '2022-12-31',
+            start='2013-12-31', # '2022-12-31',
             portfolio_list=[],
             concurrent_download = False
         ),
@@ -256,34 +299,19 @@ if __name__ == "__main__":
             periods=10
         ),
         export=ExportConfig(
-            update_history=True, # True, False
+            update_history=False, # True, False
             base_path="./data/time_series",
             s3_config=None
         )
     )
 
-    # --- Check for incremental update ---
-    cfg = FileConfig()
-    mgr = FileDataManager(cfg)
-    identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
+    # Note: The ETL function will automatically handle incremental updates
+    # by checking all data files and using the earliest last date
 
-    if not model_input.export.update_history:
-        # Try to read last date from prices file
-        try:
-            df_existing = mgr.load_prices(identifier+'_members')
-            last_date = pd.to_datetime(df_existing['date']).max()
-            print(f"Last updated date in prices: {last_date}")
-
-            # Set model_input.backtest.start to last_date (or last_date + 1 day)
-            model_input.backtest.start_date = (last_date + pd.Timedelta(days=-3)).date() # 04/24/2025
-        except Exception as e:
-            print("No existing data found or error reading file, running full history.")
-            model_input.export.update_history = True
-
-    # Set portfolio turnover dates
+    # Set portfolio turnover dates: model_input.backtest.dates_turnover
     set_model_input_dates_turnover(model_input)
 
-    # Set daily business dates
+    # Set daily business dates: model_input.backtest.dates_daily
     set_model_input_dates_daily(model_input)
 
     # ETL to download and update data
@@ -296,6 +324,11 @@ if __name__ == "__main__":
     etl_universe_data(model_input)
 
     # Get data from files
+    identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
+
+    cfg = FileConfig()
+    mgr = FileDataManager(cfg)
+
     df_benchmark_prices = mgr.load_prices(identifier)
     df_benchmark_weights = mgr.load_benchmark_weights(identifier)
     df_prices = mgr.load_prices(identifier+'_members')

@@ -40,6 +40,13 @@ logs/
 
 # data
 data/market_data.db
+# SPX data files (large files, should not be version controlled)
+data/time_series/**/SPX*.parquet
+data/time_series/benchmarks/SPX_Index_weights.parquet
+data/time_series/exposures/SPX_Index_members.parquet
+data/time_series/prices/SPX*.parquet
+data/time_series/returns/SPX_Index_members.parquet
+data/time_series/factors/SPX*.parquet
 
 # src
 app_factors_v1.py

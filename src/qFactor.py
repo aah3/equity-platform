@@ -6,10 +6,16 @@ Created on Sat Mar 15 18:36:21 2025
 @author: alfredo
 """
 
-from typing import Dict, List, Optional, Union, Tuple, Literal, Any, Sequence
+from typing import Dict, List, Optional, Union, Tuple, Literal, Any, Sequence, TypeVar, Generic
 from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
-import datetime
 from datetime import date, timedelta #, datetime
+from functools import lru_cache
+from scipy import stats
+from enum import Enum
+from decimal import Decimal
+
+import os
+import datetime
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -17,21 +23,15 @@ import time
 import warnings
 import urllib
 import urllib.request
-from functools import lru_cache
-
+import asyncio
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
 import scipy.sparse as sp
 import statsmodels.api as sm
-from utils import *
-
-from enum import Enum
-from decimal import Decimal
 import logging # Good practice to log errors
 
-
 from qOptimization import (PurePortfolioConstraints, PureFactorOptimizer)
+# from utils import *
 import qBacktest as bt
 
 # Helper functions: get index constituents
@@ -48,6 +48,11 @@ INDEX_CONFIG = {
         'url': 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', # 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
         'table_index': 0 # The first table on the page is the components list
     },
+    '^SPX': {
+        'url': 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', # 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
+        'table_index': 0 # The first table on the page is the components list
+    },
+
     '^NDX': {
         'url': 'https://en.wikipedia.org/wiki/Nasdaq-100#Components', # 'https://en.wikipedia.org/wiki/Nasdaq-100',
         'table_index': 4 # The table titled "Components"
@@ -56,95 +61,16 @@ INDEX_CONFIG = {
     # '^FTSE': { 'url': '...', 'table_index': ... },
 }
 
-
-def get_index_constituents(ticker: str) -> pd.DataFrame:
-    """
-    Fetches the constituent stocks for a given index ticker from Wikipedia.
-
-    Args:
-        ticker: The index ticker symbol (e.g., '^DJI', '^GSPC', '^NDX').
-
-    Returns:
-        A pandas DataFrame with the constituent data, or an empty
-        DataFrame if the ticker is not found or an error occurs.
-    """
-    # 1. Look up the ticker in our configuration map
-    config = INDEX_CONFIG.get(ticker)
-
-    # 2. If ticker is not in our map, return an empty DataFrame
-    if not config:
-        logging.warning(f"Ticker '{ticker}' not configured. Returning empty DataFrame.")
-        return pd.DataFrame()
-
-    url_name = config['url']
-    table_idx = config['table_index']
-
-    try:
-        # 3. Create the request with a User-Agent to avoid 403 Forbidden error
-        req = urllib.request.Request(
-            url_name, 
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-
-        # 4. Open the request and pass the file-like response to pandas
-        with urllib.request.urlopen(req) as response:
-            # pd.read_html returns a list of *all* tables on the page
-            all_tables = pd.read_html(response)
-
-        # 5. Select the correct table using the index from our config
-        constituents_df = all_tables[table_idx]
-        
-        logging.info(f"Successfully fetched {len(constituents_df)} constituents for {ticker}.")
-        return constituents_df
-
-    except urllib.error.HTTPError as e:
-        # Handle web errors (e.g., 404 Not Found, 500 Server Error)
-        logging.error(f"HTTP Error for {ticker} at {url_name}: {e}")
-        return pd.DataFrame()
-    except IndexError:
-        # Handle if the page structure changed and our table_index is wrong
-        logging.error(f"Error: Table index {table_idx} not found for {ticker} at {url_name}.")
-        return pd.DataFrame()
-    except Exception as e:
-        # Handle any other unexpected errors
-        logging.error(f"An unexpected error occurred for {ticker}: {e}")
-        return pd.DataFrame()
-
-
-# Config ID function
-def default_json_encoder(o):
-    import datetime
-    if isinstance(o, (datetime.date, datetime.datetime)):
-        return o.isoformat()
-    if isinstance(o, Decimal):
-        return float(o)  # or str(o) if you want to preserve exact value
-    raise TypeError(f'Object of type {o.__class__.__name__} is not JSON serializable')
-
-def generate_config_id(config: dict, prefix: Optional[str] = None) -> str:
-    """
-    Generate a deterministic, unique config_id for a given configuration dictionary.
-    
-    Args:
-        config (dict): The configuration dictionary (should be serializable).
-        prefix (str, optional): Optional prefix for readability (e.g., 'yahoo', '20240601').
-    
-    Returns:
-        str: A unique, deterministic config_id.
-    """
-    import hashlib
-    import json
-    from datetime import datetime
-
-    # Serialize config to JSON with sorted keys for consistency
-    config_json = json.dumps(config, sort_keys=True, separators=(',', ':'), default=default_json_encoder)
-    # Hash the JSON string
-    config_hash = hashlib.sha256(config_json.encode('utf-8')).hexdigest()[:12]  # Shorten for readability
-    # Optionally add a prefix (e.g., data source, date)
-    if prefix:
-        config_id = f"{prefix}_{config_hash}"
-    else:
-        config_id = config_hash
-    return config_id
+# Mapping of credit ratings to numeric values (higher is better quality)
+RATING_VALUE_MAP = {
+    'AAA': 22, 'AA+': 21, 'AA': 20, 'AA-': 19,
+    'A+': 18, 'A': 17, 'A-': 16,
+    'BBB+': 15, 'BBB': 14, 'BBB-': 13,
+    'BB+': 12, 'BB': 11, 'BB-': 10,
+    'B+': 9, 'B': 8, 'B-': 7,
+    'CCC+': 6, 'CCC': 5, 'CCC-': 4,
+    'CC': 3, 'C': 2, 'D': 1
+}
 
 """
 # Define framework classes
@@ -156,7 +82,39 @@ class DataSource(str, Enum):
     REUTERS = "reuters"
     CUSTOM = "custom"
 
-class Universe(str, Enum):
+class Country(str, Enum):
+    US = "US"
+    Canada = "Canada"
+    UK = "UK"
+    France = "France"
+    Germany = "Germany"
+    Spain = "Spain"
+    Italy = "Italy"
+    Netherlands = "Netherlands"
+    Swiss = "Swiss"
+    Japan = "Japan"
+    HongKong = "Hong Kong"
+    China = "China"
+    Australia = "Australia"
+    Korea = "Korea"
+    India = "India"
+    Singapore = "Singapore"
+    Malaysia = "Malaysia"
+    Brazil = "Brazil"
+    Mexico = "Mexico"
+    Chile = "Chile"
+    Argentina = "Argentina"
+    SaudiArabia = "Saudi Arabia"
+    AbuDhabi = "Abu Dhabi"
+    Dubai = "Dubai"
+    Qatar = "Qatar"
+    Africa = "Africa"
+    Europe = "Europe"        # regional “country” used in your get_by_country
+    Global = "Global"        # regional bucket
+    Specific = "Specific"    # sector/special bucket
+    Other = "Other"
+
+class Universe_v0(str, Enum):
     """Global investment universe options"""
     # North America
     NDX = "NDX Index"
@@ -274,6 +232,268 @@ class Universe(str, Enum):
         }
         return {index.name: index.description for index in region_mapping.get(region, [])}
 
+class Universe(str, Enum):
+    """Global investment universe options"""
+    # North America
+    NDX = "NDX Index"
+    SPX = "SPX Index"
+    B500 = "B500 Index"
+    B100Q = "B100Q Index"
+    RTY = "RTY Index"  # Russell 2000
+    SPTSX = "SPTSX Index" # CND market index
+    MID = "MID Index"
+    SML = "SML Index"
+    INDU = "INDU Index"
+    DW25 = "DW25 Index"
+    DWLGT = "DWLGT Index"
+    QQQ = "QQQ US Equity"
+    RDG = "RDG Index" # Russell Midcap Growth Index
+    BMIDG = "BMIDG Index" # Bloomberg US Mid Cap Growth Pr
+    RLV = "RLV Index" # Russell 1000 Value Index
+    B500VT = "B500VT Index" # Bloomberg 500 Value Total Return Index
+
+    # Europe
+    SXXP = "SXXP Index" # European stocks
+    UKX = "UKX Index"
+    CAC = "CAC Index"
+    DAX = "DAX Index"
+    IBEX = "IBEX Index"
+    FTSEMIB = "FTSEMIB Index"
+    AEX = "AEX Index"
+    SMI = "SMI Index"
+    NDDUEMU = "NDDUEMU Index" # Eurozone market index
+    
+    # Asia Pacific
+    NKY = "NKY Index"
+    HSI = "HSI Index"
+    SHSZ300 = "SHSZ300 Index"
+    AS51 = "AS51 Index"
+    KOSPI = "KOSPI Index"
+    NIFTY = "NIFTY Index"
+    STI = "STI Index"
+    NDDUJN = "NDDUJN Index" # Japan market index
+    FBMKLCI = "FBMKLCI Index" # Malaysia index
+    
+    # Latin America
+    IBOV = "IBOV Index"
+    MEXBOL = "MEXBOL Index"
+    IPSA = "IPSA Index"
+    MERVAL = "MERVAL Index"
+    
+    # Middle East
+    SASEIDX = "SASEIDX Index" # TADAWUL
+    ADX = "ADX Index" # ADSMI Index
+    DFM = "DFM Index" # DFMGI Index
+    QE = "QE Index" # QEAS Index
+    
+    # Africa
+    TOP40 = "TOP40 Index"
+    
+    # Global
+    MXEA = "MXEA Index"
+    SEMLMCUP = "SEMLMCUP Index"
+    RENEW = "RENEW Index"
+    NDUEEGF = "NDUEEGF Index"
+    
+    # Specific / Sectors
+    SPSIINST = "SPSIINST Index"
+
+    @property
+    def description(self) -> str:
+        """Returns the detailed description of the universe"""
+        descriptions: Dict[Universe, str] = {
+            # North America
+            Universe.NDX: "NASDAQ-100 Index - Top 100 non-financial companies listed on NASDAQ",
+            Universe.SPX: "S&P 500 Index - 500 largest US publicly traded companies",
+            Universe.RTY: "Russell 2000 Index - 2000 small-cap US companies",
+            Universe.SML: "S&P 600 Index - Smallcap 600 Index",
+            Universe.SPTSX: "S&P/TSX Composite Index - Canadian equity market benchmark",
+            Universe.DW25: "Dow Jones Wilshire 2500 Index",
+            Universe.DWLGT: "Dow Jones US Large-Cap Growth Index",
+            Universe.RDG: "Russell Midcap Growth Index measures the performance of those Russell Midcap companies with higher price-to-book ratios and higher forecasted growth values.",
+            Universe.BMIDG: "Bloomberg US Mid Cap Growth Price Return USD is a float market-cap-weighted Index USD based on an equal-weighted combination of four factors: earnings yield, valuation, dividend yield, and growth.",
+            Universe.RLV: "Russell 1000 Value Index measures the performance of those Russell 1000 companies with lower price-to-book ratios and lower forecasted growth values. The index was developed with a base value of 200 as of August 31, 1992.",
+            Universe.B500VT: "Bloomberg 500 Value Total Return Index provides exposure to companies with superior value factor scores based on their earnings yield, valuation, dividend yield, and growth.",
+            
+            # Europe
+            Universe.SXXP: "STOXX Europe 600 - Companies across 17 European countries",
+            Universe.UKX: "FTSE 100 Index - 100 largest companies listed on London Stock Exchange",
+            Universe.CAC: "CAC 40 - Benchmark French stock market index of 40 largest equities",
+            Universe.DAX: "DAX 40 - 40 major German blue chip companies trading on Frankfurt Exchange",
+            Universe.IBEX: "IBEX 35 - Benchmark index of Spain's principal stock exchange",
+            Universe.FTSEMIB: "FTSE MIB - 40 most traded stock classes on Italian Exchange",
+            Universe.AEX: "AEX Index - 25 most traded Dutch companies on Amsterdam Exchange",
+            Universe.SMI: "Swiss Market Index - 20 largest Swiss publicly traded companies",
+            Universe.NDDUEMU: "MSCI EMU - Eurozone Economic and Monetary Union",
+            
+            # Asia Pacific
+            Universe.NKY: "Nikkei 225 - Leading Japanese stock market index",
+            Universe.HSI: "Hang Seng Index - Main indicator of Hong Kong market performance",
+            Universe.SHSZ300: "CSI 300 Index - 300 largest A-share stocks in Shanghai and Shenzhen",
+            Universe.AS51: "S&P/ASX 200 - Benchmark for Australian equity market",
+            Universe.KOSPI: "Korea Composite Stock Price Index - Main benchmark of South Korea",
+            Universe.NIFTY: "NIFTY 50 - Benchmark Indian National Stock Exchange index",
+            Universe.STI: "Straits Times Index - Benchmark index for Singapore stock market",
+            Universe.NDDUJN: "MSCI Japan Net Total Return USD Index",
+            Universe.FBMKLCI: "FTSE Bursa Malaysia KLCI Index - Kuala Lumpur Composite Index",
+            
+            # Latin America
+            Universe.IBOV: "Ibovespa - Benchmark index of Brazil's São Paulo Stock Exchange",
+            Universe.MEXBOL: "S&P/BMV IPC - Main benchmark of Mexican Stock Exchange",
+            Universe.IPSA: "S&P/CLX IPSA - Main stock market index of Chile",
+            Universe.MERVAL: "S&P MERVAL - Main index of Buenos Aires Stock Exchange",
+            
+            # Middle East
+            Universe.SASEIDX: "Tadawul All Share Index - Main index of Saudi Stock Exchange",
+            Universe.ADX: "Abu Dhabi Securities Exchange General Index",
+            Universe.DFM: "Dubai Financial Market General Index",
+            Universe.QE: "Qatar Exchange Index - Main benchmark of Qatar Stock Exchange",
+            
+            # Africa
+            Universe.TOP40: "FTSE/JSE Top 40 - Largest 40 companies on Johannesburg Stock Exchange",
+            
+            # Global
+            Universe.MXEA: "The MSCI EAFE region covers DM countries in Europe, Australasia, Israel, and the Far East",
+            Universe.SEMLMCUP: "Solactive GBS Emerging Markets Large & Mid Cap USD Index PR",
+            Universe.RENEW: "Eagle Global Renewables Infrastructure Index PR",
+            Universe.NDUEEGF: "MSCI Emerging Net Total Return USD Index",
+            
+            # Specific
+            Universe.SPSIINST: "S&P Insurance Select Industry Total Return Index"
+        }
+        return descriptions[self]
+
+    @classmethod
+    def get_all_descriptions(cls) -> Dict[str, str]:
+        """Returns a dictionary of all universes and their descriptions"""
+        return {universe.name: universe.description for universe in cls}
+
+    @classmethod
+    def get_by_region(cls, region: str) -> Dict[str, str]:
+        """Returns indices for a specific region
+        Regions: 'North America', 'Europe', 'Asia Pacific', 'Latin America', 'Middle East & Africa'
+        """
+        region_mapping = {
+            'North America': [cls.NDX, cls.SPX, cls.RTY, cls.SML, cls.SPTSX, cls.DW25, cls.DWLGT, cls.RDG, cls.BMIDG, cls.RLV, cls.B500VT],
+            'Europe': [cls.SXXP, cls.UKX, cls.CAC, cls.DAX, cls.IBEX, cls.FTSEMIB, cls.AEX, cls.SMI],
+            'Asia Pacific': [cls.NKY, cls.HSI, cls.SHSZ300, cls.AS51, cls.KOSPI, cls.NIFTY, cls.STI, cls.NDDUJN, cls.FBMKLCI],
+            'Latin America': [cls.IBOV, cls.MEXBOL, cls.IPSA, cls.MERVAL],
+            'Middle East & Africa': [cls.SASEIDX, cls.ADX, cls.DFM, cls.QE, cls.TOP40],
+            'Global': [cls.MXEA, cls.SEMLMCUP, cls.RENEW, cls.NDUEEGF],
+            'Specific': [cls.SPSIINST]
+        }
+        return {index.name: index.description for index in region_mapping.get(region, [])}
+
+    @classmethod
+    def get_by_country(cls, country: str) -> Dict[str, str]:
+        """Returns indices for a specific region
+        Regions: 'North America', 'Europe', 'Asia Pacific', 'Latin America', 'Middle East & Africa'
+        """
+        country_mapping = {
+            'US': [cls.NDX, cls.SPX, cls.RTY, cls.DW25, cls.DWLGT, cls.SML, cls.RDG, cls.BMIDG],
+            'Canada': [cls.SPTSX],
+            'Europe': [cls.SXXP],
+            'UK': [cls.UKX],
+            'France': [cls.CAC], 
+            'Germany': [cls.DAX], 
+            'Spain': [cls.IBEX], 
+            'Italy': [cls.FTSEMIB], 
+            'Netherlands': [cls.AEX], 
+            'Swiss': [cls.SMI],
+            'Japan': [cls.NKY, cls.NDDUJN], 
+            'Hong Kong': [cls.HSI], 
+            'China': [cls.SHSZ300], 
+            'Australia': [cls.AS51], 
+            'Korea': [cls.KOSPI], 
+            'India': [cls.NIFTY], 
+            'Singapore': [cls.STI], 
+            'Malaysia': [cls.FBMKLCI],
+            'Brazil': [cls.IBOV], 
+            'Mexico': [cls.MEXBOL], 
+            'Chile': [cls.IPSA], 
+            'Argentina': [cls.MERVAL],
+            'Saudi Arabia': [cls.SASEIDX], # TADAWUL
+            'Abu Dhabi': [cls.ADX], 
+            'Dubai': [cls.DFM], 
+            'Qatar': [cls.QE], 
+            'Africa': [cls.TOP40],
+            'Global': [cls.MXEA, cls.SEMLMCUP, cls.RENEW, cls.NDUEEGF],
+            'Specific': [cls.SPSIINST]
+        }
+        return {index.name: index.description for index in country_mapping.get(country, [])}
+
+# ---- Universe → Country map (single source of truth) ------------------------
+# Keep this centralized; update as you add universes. No duplication of Universe class.
+# Tip: if you prefer, derive this from a config file at startup.
+UNIVERSE_COUNTRY: Dict[Universe, Country] = {
+    # North America
+    Universe.NDX: Country.US,
+    Universe.SPX: Country.US,
+    Universe.B500: Country.US,
+    Universe.B100Q: Country.US,
+    Universe.RTY: Country.US,
+    Universe.MID: Country.US,
+    Universe.SML: Country.US,
+    Universe.DW25: Country.US,
+    Universe.DWLGT: Country.US,
+    Universe.QQQ: Country.US,
+    Universe.RDG: Country.US,
+    Universe.BMIDG: Country.US,
+    Universe.RLV: Country.US,
+    Universe.B500VT: Country.US,
+    Universe.SPTSX: Country.Canada,
+
+    # Europe
+    Universe.SXXP: Country.Europe,
+    Universe.UKX: Country.UK,
+    Universe.CAC: Country.France,
+    Universe.DAX: Country.Germany,
+    Universe.IBEX: Country.Spain,
+    Universe.FTSEMIB: Country.Italy,
+    Universe.AEX: Country.Netherlands,
+    Universe.SMI: Country.Swiss,
+    Universe.NDDUEMU: Country.Europe,
+
+    # Asia Pacific
+    Universe.NKY: Country.Japan,
+    Universe.NDDUJN: Country.Japan,
+    Universe.HSI: Country.HongKong,
+    Universe.SHSZ300: Country.China,
+    Universe.AS51: Country.Australia,
+    Universe.KOSPI: Country.Korea,
+    Universe.NIFTY: Country.India,
+    Universe.STI: Country.Singapore,
+    Universe.FBMKLCI: Country.Malaysia,
+
+    # Latin America
+    Universe.IBOV: Country.Brazil,
+    Universe.MEXBOL: Country.Mexico,
+    Universe.IPSA: Country.Chile,
+    Universe.MERVAL: Country.Argentina,
+
+    # Middle East
+    Universe.SASEIDX: Country.SaudiArabia,
+    Universe.ADX: Country.AbuDhabi,
+    Universe.DFM: Country.Dubai,
+    Universe.QE: Country.Qatar,
+
+    # Africa
+    Universe.TOP40: Country.Africa,
+
+    # Global / Specific
+    Universe.MXEA: Country.Global,
+    Universe.SEMLMCUP: Country.Global,
+    Universe.RENEW: Country.Global,
+    Universe.NDUEEGF: Country.Global,
+    Universe.SPSIINST: Country.Specific,
+}
+
+def universe_country(u: Universe) -> Country:
+    try:
+        return UNIVERSE_COUNTRY[u]
+    except KeyError as e:
+        raise ValueError(f"Universe {u} is missing in UNIVERSE_COUNTRY mapping.") from e
+ 
 class Currency(str, Enum):
     """Available currencies"""
     USD = "USD"
@@ -313,7 +533,17 @@ class RiskFactors(str, Enum):
     SEASONALITY = "seasonality"
     ANALYST_SENTIMENT = "analyst_sentiment"
     ESG = "esg"
-
+    RATING = "rating"
+    PE_RATIO = "pe_ratio"
+    CFO_TO_SALES = "cfo_to_sales"
+    ROE = "roe"
+    ROA = "roa"
+    ROIC = "roic"
+    EPS = "eps"
+    EPS_GROWTH = "eps_growth"
+    EPS_GROWTH_5Y = "eps_growth_5y"
+    EPS_GROWTH_10Y = "eps_growth_10y"
+    
     @property
     def description(self) -> str:
         """Returns detailed description and common implementation of the risk factor"""
@@ -339,7 +569,17 @@ class RiskFactors(str, Enum):
             RiskFactors.VOL_RISK_PREMIUM: "Volatility risk premium. Implementation: Implied minus realized volatility.",
             RiskFactors.SEASONALITY: "Calendar anomalies. Implementation: Historical average returns by time period.",
             RiskFactors.ANALYST_SENTIMENT: "Analyst revisions/sentiment. Implementation: Change in consensus estimates.",
-            RiskFactors.ESG: "Environmental, Social, Governance. Implementation: Third-party ESG scores or composite metrics."
+            RiskFactors.ESG: "Environmental, Social, Governance. Implementation: Third-party ESG scores or composite metrics.",
+            RiskFactors.RATING: "Credit Rating. Implementation: Credit rating mapped to custom RATING_VALUE_MAP",
+            RiskFactors.PE_RATIO: "PE Ratio. Implementation: FA_PERIOD_TYPE='Q' populated daily.",
+            RiskFactors.CFO_TO_SALES: "Cash from Operations to Revenue (%). Implementation: Cash from Operations / Revenue.",
+            RiskFactors.ROE: "Return on Equity. Implementation: Net Income / Shareholders' Equity.",
+            RiskFactors.ROA: "Return on Assets. Implementation: Net Income / Total Assets.",
+            RiskFactors.ROIC: "Return on Invested Capital. Implementation: Net Income / Invested Capital.",
+            RiskFactors.EPS: "Earnings per Share. Implementation: Net Income / Shares Outstanding.",
+            RiskFactors.EPS_GROWTH: "Earnings per Share Growth. Implementation: (EPS_t - EPS_t-1) / EPS_t-1.",
+            RiskFactors.EPS_GROWTH_5Y: "Earnings per Share Growth (5Y). Implementation: (EPS_t - EPS_t-5) / EPS_t-5.",
+            RiskFactors.EPS_GROWTH_10Y: "Earnings per Share Growth (10Y). Implementation: (EPS_t - EPS_t-10) / EPS_t-10."
         }
         return descriptions[self]
 
@@ -373,7 +613,17 @@ class RiskFactors(str, Enum):
             RiskFactors.VOL_RISK_PREMIUM: "Market",
             RiskFactors.SEASONALITY: "Technical",
             RiskFactors.ANALYST_SENTIMENT: "Sentiment",
-            RiskFactors.ESG: "Fundamental"
+            RiskFactors.ESG: "Fundamental",
+            RiskFactors.RATING: "Fundamental",
+            RiskFactors.PE_RATIO: "Fundamental",
+            RiskFactors.CFO_TO_SALES: "Fundamental",
+            RiskFactors.ROE: "Fundamental",
+            RiskFactors.ROA: "Fundamental",
+            RiskFactors.ROIC: "Fundamental",
+            RiskFactors.EPS: "Fundamental",
+            RiskFactors.EPS_GROWTH: "Fundamental",
+            RiskFactors.EPS_GROWTH_5Y: "Fundamental",
+            RiskFactors.EPS_GROWTH_10Y: "Fundamental"
         }
         return categories[self]
 
@@ -486,7 +736,7 @@ class WeightingScheme(str, Enum):
     RISK_WEIGHT = "risk_wgt"
     CUSTOM = "custom"
 
-class ParamsConfig(BaseModel):
+class ParamsConfig_v0(BaseModel):
     """Configuration for general parameters"""
     aum: Decimal = Field(gt=0, description="Assets under management in millions of local currency")
     sigma_regimes: bool = Field(default=False, description="Whether to use regime-dependent covariances")
@@ -506,6 +756,43 @@ class ParamsConfig(BaseModel):
                                   description="Number of buckets for percentile portfolios.")    
     @field_validator('risk_factors')
     def sort_risk_factors(cls, v):
+        return sorted(v)
+
+RF = TypeVar("RF")
+class ParamsConfig(BaseModel, Generic[RF]):
+    """Configuration for general parameters, parametrized over RF."""
+    aum: Decimal = Field(
+        gt=0,
+        description="Assets under management in millions of local currency"
+    )
+    sigma_regimes: bool = Field(
+        default=False,
+        description="Whether to use regime-dependent covariances"
+    )
+    sector_neutral : bool = Field(
+        default=False,
+        description="Neutralize sector exposure when optimizing portfolios"
+    )
+    # 2. risk_factors is now List[RF] instead of List[RiskFactors]
+    risk_factors: List[RF] = Field(
+        default_factory=list,
+        description="List of risk factors to include in the model"
+    )
+    sector_classification: Optional[str] = Field(
+        default='GICS',
+        description="Sector classification for analysis"
+    )
+    bench_weights: Optional[WeightingScheme] = Field(
+        default=None,
+        description="Benchmark weighting scheme"
+    )
+    n_dates:   Optional[int] = Field(default=None, description="Number of dates in backtest")
+    n_sids:    Optional[int] = Field(default=None, description="Number of securities in backtest")
+    n_buckets: Optional[int] = Field(default=None, description="Buckets for percentile portfolios")
+
+    # 3. We can still sort them, regardless of what RF actually is
+    @field_validator("risk_factors", mode="after")
+    def sort_risk_factors(cls, v: List[RF]) -> List[RF]:
         return sorted(v)
 
 class BacktestConfig(BaseModel):
@@ -771,9 +1058,100 @@ class SecurityMasterBloomberg(BaseModel):
     df_price: pd.DataFrame = pd.DataFrame()
     weights_data: Optional[pd.DataFrame] = None
     security_master: Optional[pd.DataFrame] = None
+    meta_data: Optional[pd.DataFrame] = None
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
+    def fill_equal_values(df: pd.DataFrame, group_by_col: str = 'date', check_col: str = 'weight') -> pd.DataFrame:
+        """
+        Ensure every date-group in df has a non-null weight column:
+          - If the weight column doesn't exist, create it.
+          - For each date, if any row has weight == NaN, then override that entire date-group
+            with equal weights summing to 1.
+
+        Returns a new DataFrame (does not operate in-place).
+        
+        Usage: df = fill_equal_values(df, group_by_col='date', check_col='weight')
+        """
+        df = df.copy()
+
+        # 1) make sure the weight column exists
+        if check_col not in df.columns:
+            df[check_col] = np.nan
+
+        # 2) for each date, check for any NaNs and, if so, assign 1/n to every row in that group
+        def _fill_grp(g):
+            if g[check_col].isna().any():
+                g[check_col] = 1.0 / len(g)
+            return g
+
+        return (
+            df
+            .groupby(group_by_col, group_keys=False)  # don't add the group key to the index
+            .apply(_fill_grp)
+        )
+
+    def get_meta_data(self, sector_classification: str = 'BICS') -> None:
+        """
+        Get meta data for security master tickers data including sector, industry, sub-industry classifications, etc.
+        Data not time series dependent, but static.
+        
+        Args:
+            sector_classification: 'BICS' or 'GICS'
+            
+        Returns:
+            DataFrame with security master data
+        """
+        univ_list = list(self.weights_data.sid.unique())
+                    
+        # Get sector classification
+        if sector_classification.upper() == 'BICS':
+            sector = self.bq.data.bics_level_1_sector_name()
+            # industry_group = self.bq.data.BICS_LEVEL_2_INDUSTRY_GROUP_NAME()
+            industry = self.bq.data.BICS_LEVEL_3_INDUSTRY_NAME()
+            sub_industry = self.bq.data.BICS_LEVEL_4_SUB_INDUSTRY_NAME()
+            request = {'sector': sector, 'industry': industry, 'sub_industry': sub_industry}
+        elif sector_classification.upper() == 'GICS':
+            gics = self.bq.data.gics_sub_industry()
+            sector = self.bq.data.gics_sector_name()
+            industry_group = self.bq.data.GICS_INDUSTRY_GROUP_NAME()
+            industry = self.bq.data.GICS_INDUSTRY_NAME()
+            sub_industry = self.bq.data.GICS_SUB_INDUSTRY_NAME()
+            request = {'gics': gics, 'sector': sector, 'industry_group': industry_group, 'industry': industry, 'sub_industry': sub_industry}
+        else:
+            raise ValueError("sector_classification must be either 'BICS' or 'GICS'")
+
+        req = bql.Request(univ_list, request)
+        res = self.bq.execute(req)
+        meta_data = pd.DataFrame({r.name: r.df()[r.name] for r in res})
+        meta_data = meta_data.reset_index(drop=False).rename(columns={'ID': 'sid'})
+        meta_data.index = meta_data.sid
+        meta_data.index.name = None
+
+        self.meta_data = meta_data
+        return None
+
+    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
+        """
+        Get dummy dataframe from meta data
+        
+        Args:
+            dummy_name: 'sector', 'industry_group', 'industry', 'sub_industry'
+            
+        Returns:
+            DataFrame with dummy_name as columns and values of 0 or 1
+            DataFrame index is the security id.
+        """
+        if self.meta_data is None:
+            self.get_meta_data()
+
+        from utils import clean_list_items
+        df_dummies = pd.get_dummies(self.meta_data[dummy_name])
+        input_list = list(df_dummies.columns)
+
+        df_dummies.columns = clean_list_items(input_list)
+        return df_dummies
+
     def get_benchmark_weights(self) -> pd.DataFrame:
         """
         Get benchmark constituent weights over time
@@ -978,6 +1356,21 @@ class SecurityMasterBloomberg(BaseModel):
         df_ret_wide.fillna(0., inplace=True)
         return df_ret_wide
 
+    def get_volume_long(self, n_window=22) -> pd.DataFrame:
+        if self.df_price.shape[0] > 0:
+            df_volume = self.df_price[['date','sid','price','volume']].reset_index(drop=True).copy()
+            df_volume['volume_mm'] = df_volume['price'] * df_volume['volume']/1e6
+            df_volume.sort_values(by=['sid','date'], ascending=(True, True), inplace=True)
+
+            df_volume['volume_avg'] = df_volume.groupby('sid')['volume'].rolling(window=n_window).mean().reset_index(drop=True)
+            df_volume['volume_mm_avg'] = df_volume.groupby('sid')['volume_mm'].rolling(window=n_window).mean().reset_index(drop=True)
+            df_volume.fillna(0., inplace=True)
+            df_volume.reset_index(drop=True, inplace=True)
+            # display(df_volume.groupby(['sid']).tail(1).sort_values(['volume_mm_avg'], ascending=False).head())
+            return df_volume
+        
+        return pd.DataFrame()
+
 class SecurityMasterYahoo(BaseModel):
     """
     SecurityMaster class using Yahoo Finance API for handling benchmark constituents and security master data.
@@ -993,6 +1386,7 @@ class SecurityMasterYahoo(BaseModel):
     df_portfolio: pd.DataFrame = pd.DataFrame()
     concurrent_download: Optional[bool] = None
     model_input: Optional[Any] = None
+    meta_data: Optional[pd.DataFrame] = None
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -1001,6 +1395,99 @@ class SecurityMasterYahoo(BaseModel):
     #         self.universe='^NDX'
     #     else:
     #         self.universe='^SPX'
+
+    def fill_equal_values(df: pd.DataFrame, group_by_col: str = 'date', check_col: str = 'weight') -> pd.DataFrame:
+        """
+        Ensure every date-group in df has a non-null weight column:
+          - If the weight column doesn't exist, create it.
+          - For each date, if any row has weight == NaN, then override that entire date-group
+            with equal weights summing to 1.
+
+        Returns a new DataFrame (does not operate in-place).
+        
+        Usage: df = fill_equal_values(df, group_by_col='date', check_col='weight')
+        """
+        df = df.copy()
+
+        # 1) make sure the weight column exists
+        if check_col not in df.columns:
+            df[check_col] = np.nan
+
+        # 2) for each date, check for any NaNs and, if so, assign 1/n to every row in that group
+        def _fill_grp(g):
+            if g[check_col].isna().any():
+                g[check_col] = 1.0 / len(g)
+            return g
+
+        return (
+            df
+            .groupby(group_by_col, group_keys=False)  # don't add the group key to the index
+            .apply(_fill_grp)
+        )
+
+    def get_meta_data(self, sector_classification: str = 'Custom') -> None:
+        """
+        Get meta data for security master tickers data including sector, industry, sub-industry classifications, etc.
+        Data not time series dependent, but static.
+        
+        Args:
+            sector_classification: 'BICS' or 'GICS'
+            
+        Returns:
+            DataFrame with security master data
+        """
+        univ_list = list(self.weights_data.sid.unique())
+                    
+        # Get sector classification
+        if sector_classification.upper() == 'BICS':
+            sector = self.bq.data.bics_level_1_sector_name()
+            # industry_group = self.bq.data.BICS_LEVEL_2_INDUSTRY_GROUP_NAME()
+            industry = self.bq.data.BICS_LEVEL_3_INDUSTRY_NAME()
+            sub_industry = self.bq.data.BICS_LEVEL_4_SUB_INDUSTRY_NAME()
+            request = {'sector': sector, 'industry': industry, 'sub_industry': sub_industry}
+        elif sector_classification.upper() == 'GICS':
+            gics = self.bq.data.gics_sub_industry()
+            sector = self.bq.data.gics_sector_name()
+            industry_group = self.bq.data.GICS_INDUSTRY_GROUP_NAME()
+            industry = self.bq.data.GICS_INDUSTRY_NAME()
+            sub_industry = self.bq.data.GICS_SUB_INDUSTRY_NAME()
+            request = {'gics': gics, 'sector': sector, 'industry_group': industry_group, 'industry': industry, 'sub_industry': sub_industry}
+        elif sector_classification.upper() == 'CUSTOM':
+            self.meta_data = self.security_master
+            return None
+        else:
+            raise ValueError("sector_classification must be either 'BICS' or 'GICS'")
+
+        req = bql.Request(univ_list, request)
+        res = self.bq.execute(req)
+        meta_data = pd.DataFrame({r.name: r.df()[r.name] for r in res})
+        meta_data = meta_data.reset_index(drop=False).rename(columns={'ID': 'sid'})
+        meta_data.index = meta_data.sid
+        meta_data.index.name = None
+
+        self.meta_data = meta_data
+        return None
+
+    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
+        """
+        Get dummy dataframe from meta data
+        
+        Args:
+            dummy_name: 'sector', 'industry_group', 'industry', 'sub_industry'
+            
+        Returns:
+            DataFrame with dummy_name as columns and values of 0 or 1
+            DataFrame index is the security id.
+        """
+        if self.meta_data is None:
+            self.get_meta_data()
+
+        from utils import clean_list_items
+        df_dummies = pd.get_dummies(self.meta_data[dummy_name])
+        input_list = list(df_dummies.columns)
+
+        df_dummies.columns = clean_list_items(input_list)
+        return df_dummies
 
     def _get_ticker_components(self, ticker: str, date: str) -> pd.DataFrame: # Optional[List[str] | None]
         """
@@ -1017,14 +1504,14 @@ class SecurityMasterYahoo(BaseModel):
                 if len(components) == 0:
                     return pd.DataFrame()
                 return pd.DataFrame(components)
-            elif ticker in ['^GSPC', '^DJI', '^IXIC', '^NDX', '^SP600']: # Handle S&P 500, Dow, Nasdaq (composite and 100) explicitly.
+            elif ticker in ['^GSPC', '^DJI', '^IXIC', '^NDX', '^SP600','^SPX']: # Handle S&P 500, Dow, Nasdaq (composite and 100) explicitly.
                 if history.empty:
                   return pd.DataFrame() # []
                 # "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
                 # constituents_df = pd.read_html(
                 #     f"https://en.wikipedia.org/wiki/List_of_{ticker[1:].lower()}_companies"
                 # )[0]  # Select the first table, which usually holds the constituent list
-                if ticker == '^GSPC':
+                if ticker in ['^GSPC','^SPX']:
                     constituents_df = get_index_constituents(ticker)
                         
                     # url_name = "http://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -1212,11 +1699,27 @@ class SecurityMasterYahoo(BaseModel):
             if components.shape[0] > 0:
                 df = components.copy()
                 if 'weight' in components.columns:
-                    df['wgt'] = df['weight'].str.replace('%', '').astype(float)
-                    if df['wgt'].sum() > 1:
-                        df['wgt'] /= df['wgt'].sum()
+                    # Convert weight from string format (e.g., 'x.x%') to float
+                    if df['weight'].dtype == 'object':
+                        # String format with '%' sign
+                        df['weight'] = df['weight'].str.replace('%', '').astype(float)
+                        # If values are > 1, assume they're percentages, convert to decimal
+                        if df['weight'].sum() > 1:
+                            df['weight'] /= 100
+                        # Normalize to sum to 1 if needed
+                        if df['weight'].sum() > 1:
+                            df['weight'] /= df['weight'].sum()
+                    else:
+                        # Already a float, but might be in percentage format
+                        if df['weight'].sum() > 1:
+                            # If sum > 1, assume percentages, convert to decimal
+                            df['weight'] /= 100
+                        # Normalize to sum to 1 if needed
+                        if df['weight'].sum() > 1:
+                            df['weight'] /= df['weight'].sum()
                 else:
-                    df['wgt'] = 1 / len(components)
+                    # Missing weight column, create equally weighted
+                    df['weight'] = 1.0 / len(components)
                 return df
             return None
 
@@ -1250,9 +1753,21 @@ class SecurityMasterYahoo(BaseModel):
             # df_weights = df_weights.set_index('date')
             df_weights.index = df_weights['date']
             df_weights.index.name = 'index'
-            df_weights.rename(columns={'wgt':'weight','weight':'wgt'}, inplace=True)
-            # TO DO: CHECK DATAFRAME COLUMNS
-            # df_weights.columns = ['date','ticker','name','sector','sub_industry','weight','sid','universe_id']
+            # Ensure 'weight' column exists and is a float
+            if 'wgt' in df_weights.columns:
+                # If 'wgt' exists, rename it to 'weight' and drop any existing 'weight' column
+                if 'weight' in df_weights.columns:
+                    df_weights.drop(columns=['weight'], inplace=True)
+                df_weights.rename(columns={'wgt': 'weight'}, inplace=True)
+            # Ensure 'weight' column exists (should be created in get_components_for_date)
+            if 'weight' not in df_weights.columns:
+                # If somehow weight is missing, create equally weighted
+                def assign_equal_weights(group):
+                    group['weight'] = 1.0 / len(group)
+                    return group
+                df_weights = df_weights.groupby('date', group_keys=False).apply(assign_equal_weights)
+            # Ensure weight is float type
+            df_weights['weight'] = df_weights['weight'].astype(float)
             df_weights['universe_id'] = UniverseMappingFactory(source='yahoo', universe=self.universe)
             self.weights_data = df_weights
         else:
@@ -1690,6 +2205,21 @@ class SecurityMasterYahoo(BaseModel):
         df_ret_wide.fillna(0.0, inplace=True)
         return df_ret_wide
 
+    def get_volume_long(self, n_window=22) -> pd.DataFrame:
+        if (self.df_price.shape[0] > 0) & ('volume' in self.df_price.columns):
+            df_volume = self.df_price[['date','sid','price','volume']].reset_index(drop=True).copy()
+            df_volume['volume_mm'] = df_volume['price'] * df_volume['volume']/1e6
+            df_volume.sort_values(by=['sid','date'], ascending=(True, True), inplace=True)
+
+            df_volume['volume_avg'] = df_volume.groupby('sid')['volume'].rolling(window=n_window).mean().reset_index(drop=True)
+            df_volume['volume_mm_avg'] = df_volume.groupby('sid')['volume_mm'].rolling(window=n_window).mean().reset_index(drop=True)
+            df_volume.fillna(0., inplace=True)
+            df_volume.reset_index(drop=True, inplace=True)
+            # display(df_volume.groupby(['sid']).tail(1).sort_values(['volume_mm_avg'], ascending=False).head())
+            return df_volume
+        
+        return pd.DataFrame()
+
 def SecurityMasterFactory(model_input, *args) -> BaseModel:
     data_source = model_input.backtest.data_source
     universe = model_input.backtest.universe.value
@@ -1718,7 +2248,7 @@ def SecurityMasterFactory(model_input, *args) -> BaseModel:
     else:
         raise ValueError(f"Data source '{data_source}' is not supported.")
 
-class BQLFactor(BaseModel):
+class BQLFactor_v0(BaseModel):
     """BQLFactor class for handling Bloomberg Query Language factor data"""
     name: str
     start_date: str
@@ -2067,6 +2597,1513 @@ class BQLFactor(BaseModel):
             
         except Exception as e:
             raise Exception(f"Error getting market cap data: {str(e)}")
+
+class BQLFactor(BaseModel):
+    """BQLFactor class for handling Bloomberg Query Language factor data"""
+    name: str
+    start_date: str
+    end_date: str
+    universe: List[str]
+    currency: Optional[str] = 'USD'
+    data: Optional[pd.DataFrame] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    @field_validator('data', mode='before')
+    @classmethod
+    def validate_dataframe(cls, v: pd.DataFrame) -> pd.DataFrame:
+        if v is not None:
+            required_columns = {'date', 'factor_name', 'sid', 'value'}
+            if not all(col in v.columns for col in required_columns):
+                missing_cols = required_columns - set(v.columns)
+                raise ValueError(f"DataFrame missing required columns: {missing_cols}")
+        return v
+
+    def get_factor_data(self, bq, factor_type: str = None, **kwargs) -> pd.DataFrame:
+        """
+        Get factor data using BQL
+        
+        Args:
+            bq: Bloomberg Query instance
+            factor_type: Type of factor to retrieve (size, value, momentum, etc.)
+        """
+        # if self.data is not None:
+        #     return self.data
+        if factor_type is None:
+            factor_type = self.name
+
+        try:
+            if factor_type == 'size':
+                df = self.get_factor_size()
+            elif factor_type == 'value':
+                df = self.get_factor_value()
+            elif factor_type == 'beta':
+                df = self.get_factor_beta()
+            elif factor_type == 'momentum':
+                df = self.get_factor_momentum()
+            elif factor_type == 'profit':
+                df = self.get_factor_profit()
+            elif factor_type == 'short_interest':
+                df = self.get_factor_short_interest()
+            elif factor_type == 'leverage':
+                df = self.get_factor_leverage()
+            elif factor_type == 'earnings_yield':
+                df = self.get_factor_earnings_yield()
+            elif factor_type == 'rating':
+                df = self.get_factor_rating()
+            elif factor_type == 'shares_out_chg':
+                df = self.get_factor_shares_out_change()
+            elif factor_type == 'buy_backs':
+                df = self.get_factor_buy_backs()
+            elif factor_type=='st_momentum':
+                df = self.get_factor_st_momentum()
+            elif factor_type=='pe_ratio':
+                df = self.get_factor_pe_ratio()
+            elif factor_type=='cfo_to_sales':
+                df = self.get_factor_cfo_to_sales()
+            else:
+                raise ValueError(f"Unsupported factor type: {factor_type}")
+            df.dropna(inplace=True)
+            df.index = df['date']
+            df.index.name = 'index' 
+            return df
+        except Exception as e:
+            raise Exception(f"Error getting factor data: {str(e)}")
+
+    def get_factor_cfo_to_sales(self) -> pd.DataFrame:
+        """
+        Retrieve CashFlow from Operations to Revenue (%) for a list of securities over a backtest date range.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'shares_out'.
+                - value (float): Numeric value of CF to Sales ratio.
+        """
+        factor = 'cfo_to_sales'
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        cfo_to_sales = bq.data.cfo_to_sales(FA_PERIOD_TYPE='Q', AS_OF_DATE=dates_daily) # calc_interval=dates_daily).dropna();
+        request = {'cfo_to_sales':cfo_to_sales};
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','AS_OF_DATE':'date', 'REVISION_DATE':'revision_date', 'PERIOD_END_DATE':'period_end_date', factor:'value'}, inplace=True)
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(np.nan)
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    def get_factor_pe_ratio(self) -> pd.DataFrame:
+        """
+        Retrieve PE ratios for a list of securities over a backtest date range.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'shares_out'.
+                - value (float): Numeric value of PE ratio.
+        """
+        factor = 'pe_ratio'
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        pe_ratio = bq.data.pe_ratio(FA_PERIOD_TYPE='Q', AS_OF_DATE=dates_daily) # calc_interval=dates_daily).dropna();
+        request = {'pe_ratio':pe_ratio};
+
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','AS_OF_DATE':'date', 'REVISION_DATE':'revision_date', 'PERIOD_END_DATE':'period_end_date', factor:'value'}, inplace=True)
+
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(np.nan)
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+
+    def get_factor_beta(self) -> pd.DataFrame:
+        """
+        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'beta'.
+                - value (float): value from beta field.
+        """
+        factor = 'beta'
+        n_days = 252+1;
+        start_date = datetime.strptime(self.start_date, "%Y-%m-%d")-timedelta(days=n_days);
+        start_date = start_date.strftime("%Y-%m-%d");
+        dates_daily = bq.func.range(start_date, self.end_date)
+
+        # benchmark returns
+        tot_return = bq.data.DAY_TO_DAY_TOT_RETURN_GROSS_DVDS(dates=dates_daily, per='D').dropna();
+        request = {'tot_return':tot_return};
+        req = bql.Request(['SPX Index'], request);
+        res = bq.execute(req);
+        df_ret_index = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
+        df_ret_index.reset_index(drop=False,inplace=True);
+        df_ret_index.columns = ['date','sid','index_return'];
+        
+        # universe returns
+        returns = bq.data.DAY_TO_DAY_TOT_RETURN_GROSS_DVDS(dates=dates_daily, per='D').dropna();
+        request = {'returns': returns};
+        req = bql.Request(self.universe, request);
+        res = bq.execute(req);
+        df_ret = res[0].df();
+        df_ret.reset_index(drop=False, inplace=True);
+        df_ret.rename(columns={'ID':'sid','DATE':'date'}, inplace=True);
+        df_ret = df_ret[['date','sid','returns']]
+
+        # merge data and run regression
+        # df = compute_rolling_beta(df=df_ret, df_ret_index=df_ret_index, n_days=n_days)
+        df = compute_rolling_beta(df=df_ret, df_ret_index=df_ret_index, n_days=n_days, include_constant=True)
+
+        df = df.loc[df.date>self.start_date]
+
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.fillna(1.,inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    def get_factor_beta_v0(self) -> pd.DataFrame:
+        beta = bq.data.beta(calc_interval=bq.func.range('-1Y', '0D'), per='M').rolling(iterationdates=bq.func.range(self.start_date, self.end_date))
+        request = {'beta':beta}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = res[0].df()
+        df = df[['DATE','ORIG_IDS','beta']]
+        df.drop_duplicates(['DATE','ORIG_IDS'],inplace=True)
+        df.insert(1, 'factor_name', 'beta')
+        df.rename(columns={
+            'DATE': 'date',
+            'ORIG_IDS': 'sid',
+            'beta': 'value'
+        }, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        # df.index = df['date']
+        # df.index.name = 'index' 
+        return df
+    
+    def get_factor_beta_v1(self) -> pd.DataFrame:
+        factor = 'beta'
+        #dates = bq.func.range("2022-12-31", "2025-01-21", frq='D')
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        trading_days = bq.data.px_last(dates=dates)
+        beta_2 = bq.data.BETA(dates=dates)
+        beta = bq.func.matches(beta_2,trading_days['value']!=bql.NA)
+        beta = beta.replacenonnumeric(np.nan)
+        request = {factor: beta}
+        # req = bql.Request(self.universe, request)
+        #req = bql.Request(['AAPL US Equity','IBM US Equity'], request)
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(drop=False, inplace=True)
+        df[factor]=df.groupby('ID')[factor].ffill()
+        df.rename(columns={
+            'ID':'sid',
+            'DATE':'date',
+            factor:'value'},
+                  inplace=True)        
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+    def get_factor_beta_v2(self) -> pd.DataFrame:
+        factor = 'beta'
+        dates = bq.func.range(self.start_date, self.end_date, frq='M')
+        expr = bq.data.beta(dates=dates);
+        request_beta = bql.Request(self.universe, {'beta': expr})
+        response = bq.execute(request_beta);
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in response], axis=1)
+        df.reset_index(drop=False, inplace=True);
+        df.rename(columns={'DATE':'date', 'ID':'sid','beta':'value'}, 
+                  inplace=True);
+        df = df[['date','sid','value']];
+        
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        px_last = bq.data.px_last(dates=dates_daily, frq='d', ca_adj='full').dropna();
+        request = {'price':px_last};
+        req = bql.Request(['SPX Index'], request);
+        res = bq.execute(req);
+        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
+        df_price.reset_index(drop=False,inplace=True)
+        df_price.columns = ['date','sid','price']
+        
+        df_price = pd.DataFrame(product(list(df_price.dropna().date.unique()), self.universe));
+        df_price.columns = ['date','sid'];
+        # import pdb; pdb.set_trace()
+
+        df = df_price.merge(df, how='left', on=['date','sid']);
+        df.sort_values(by=['sid', 'date'], inplace=True);
+        df['sid'] = df['sid'].ffill();
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(1.);
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        df.reset_index(drop=True, inplace=True);
+        return df
+
+    def get_factor_beta_v3(self) -> pd.DataFrame:
+        """
+        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'beta'.
+                - value (float): value from beta field.
+        """
+        factor = 'beta'
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        beta = bq.data.beta(dates=dates)
+        request = {'beta': beta}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        
+        df['beta'] = df.groupby('sid')['beta'].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['beta']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+    def get_factor_beta_v4(self) -> pd.DataFrame:
+        """
+        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'beta'.
+                - value (float): value from beta field.
+        """
+        factor = 'beta'
+        # daily data
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        px_last = bq.data.px_last(dates=dates_daily, frq='d', ca_adj='full').dropna();
+        request = {'price':px_last};
+        req = bql.Request(['SPX Index'], request);
+        res = bq.execute(req);
+        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
+        df_price.reset_index(drop=False,inplace=True)
+        df_price.columns = ['date','sid','price']
+        df_price = pd.DataFrame(product(list(df_price.dropna().date.unique()), self.universe));
+        df_price.columns = ['date','sid'];
+        
+        # monthly data
+        dates = bq.func.range(self.start_date, self.end_date, frq='M')
+        # beta = bq.data.beta(dates=dates)
+        beta = bq.data.beta(calc_interval=dates)
+        request = {'beta': beta}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)
+        
+        df['beta'] = df.groupby('sid')['beta'].ffill().fillna(1.)
+        df['value'] = df['beta']
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df = df_price.merge(df, how='left', on=['date','sid']);
+        df.sort_values(by=['sid', 'date'], inplace=True);
+        df['sid'] = df['sid'].ffill();
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(1.);
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+    
+    def get_factor_rating(self) -> pd.DataFrame:
+        """
+        Retrieve credit ratings for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - rating (str): The textual credit rating.
+                - rating_value (float): Numeric mapping of the credit rating, higher means better quality.
+        """
+        factor = 'rating'
+        
+        # Define a function to fill NaNs with random ints around the median per date
+        def fill_with_random_near_median(group):
+            median = group['value'].median()
+            mask = group['value'].isna()
+            # Replace NaN values with a random int in [median - 1, median + 1]
+            group.loc[mask, 'value'] = np.random.randint(median - 1, median + 2, size=mask.sum())
+            return group
+
+        # get price dataframe for all available business dates
+        px_last = bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date), frq='d', ca_adj='full',currency=self.currency).dropna();
+        request = {'price':px_last};
+        req = bql.Request(['SPX Index'], request);
+        res = bq.execute(req);
+        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
+        df_price.reset_index(drop=False,inplace=True)
+        df_price.columns = ['date','sid','price']
+
+        # Define date range for the query
+        # date_range = bq.func.range(self.start_date, self.end_date)
+        date_range = pd.date_range(start=self.start_date, end=self.end_date, freq='BM').strftime('%Y-%m-%d').tolist()
+        # Build and execute BQL requests for every date
+        if False:
+            df_rating = pd.DataFrame()
+            for idate in date_range:
+                rating_expr = bq.data.rating(dates=idate);
+                request = {'rating': rating_expr};
+                req = bql.Request(self.universe, request);
+                res = bq.execute(req);
+                df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1);
+                df = df.reset_index(drop=False);
+                df.rename(columns={'DATE':'date', 'ID':'sid'}, inplace=True);
+                df['value'] = df['rating'].map(RATING_VALUE_MAP);
+                df['value'] = df['value'].fillna(df['value'].median());
+                df_rating = pd.concat([df_rating, df])
+            df = df_rating[['date','sid','value']];
+        # Build and execute many BQL requests for all dates
+        else:
+            requests = [];
+            for idate in date_range:
+                rating_expr = bq.data.rating(dates=idate);
+                requests.append(bql.Request(self.universe, {'rating': rating_expr}))
+            response = bq.execute_many(requests=requests);
+            res = list(response);
+            df = pd.concat([r[0].df() for r in res], axis=0);
+            df.reset_index(drop=False, inplace=True);
+            df.rename(columns={'DATE':'date', 'ID':'sid'}, inplace=True);
+            df['value'] = df['rating'].map(RATING_VALUE_MAP);
+            # df['value'] = df['value'].fillna(df['value'].median());
+            df = df.groupby('date', group_keys=False).apply(fill_with_random_near_median) # Apply the function to each group of the same date
+            df = df[['date','sid','value']];
+        
+        df_price = pd.DataFrame(product(list(df_price.dropna().date.unique()), self.universe));
+        df_price.columns = ['date','sid'];
+        
+        # df = df_price[['date']].merge(df, how='left', on=['date']);
+        df = df_price.merge(df, how='left', on=['date','sid']);
+        df.sort_values(by=['sid', 'date'], inplace=True);
+        df['sid'] = df['sid'].ffill();
+        df['value'] = df.groupby('sid')['value'].ffill();
+        df['value'] = 1./df['value'] # low - high rating
+
+        # Map textual ratings to numeric values
+        df.insert(1, 'factor_name', factor);
+        df = df[['date','factor_name','sid','value']]
+
+        return df# .drop(columns=[factor])
+
+    def get_factor_earnings_yield(self) -> pd.DataFrame:
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        earn_yield = bq.data.EARN_YLD(fill='prev', dates=dates)
+        earn_yield = earn_yield.replacenonnumeric(np.nan)
+        request = {'earn_yield': earn_yield}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(drop=False, inplace=True)
+        df['earn_yield']=df.groupby('ID')['earn_yield'].ffill()
+        df.rename(columns={
+            'ID':'sid',
+            'AS_OF_DATE':'date',
+            'earn_yield':'value'},
+                  inplace=True)        
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'earn_yield')
+        df['value'] = 1./df['value'] # low - high value
+        df = df[['date','factor_name','sid','value']]
+        return df
+    
+    def get_factor_leverage(self) -> pd.DataFrame:
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        lt_borrow = bq.data.BS_LT_BORROW(fill='prev', dates=dates)
+        tot_assets =  bq.data.BS_TOT_ASSET(fill='prev', fpt='ltm', dates = dates)
+        lev = (1./lt_borrow/tot_assets)*100.
+        # lev = (tot_assets/lt_borrow)*100.
+        lev = lev.replacenonnumeric(np.nan)
+        request = {'leverage': lev}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(drop=False, inplace=True)
+        df['leverage']=df.groupby('ID')['leverage'].ffill()
+        df.rename(columns={
+            'ID':'sid',
+            'AS_OF_DATE':'date',
+            'leverage':'value'},
+                  inplace=True)        
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'leverage')
+        df = df[['date','factor_name','sid','value']]
+        return df
+    
+    def get_factor_short_interest(self) -> pd.DataFrame:
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        Short = bq.data.short_int(fill='prev', dates=dates)
+        ShsEqy = bq.data.eqy_sh_out(fill='prev', dates=dates)
+        ShsBs =  bq.data.bs_sh_out(fill='prev', fpt='ltm', dates = dates)
+        Shs = bq.func.max(ShsEqy, ShsBs)
+        si = (Short/Shs)*100.
+        si = si.replacenonnumeric(np.nan)
+        request = {'short_interest': si}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(drop=False, inplace=True)
+        df['short_interest']=df.groupby('ID')['short_interest'].ffill()
+        df.rename(columns={
+            'ID':'sid',
+            'DATE':'date',
+            'short_interest':'value'},
+                  inplace=True)        
+        df.drop_duplicates(inplace=True)
+        if 'Partial Errors' in df.columns:
+            df = df.drop(columns=['Partial Errors'])
+        df.insert(1, 'factor_name', 'short_interest')
+        return df
+        
+    def get_factor_profit(self) -> pd.DataFrame:
+        factor = bq.data.normalized_profit_margin(dates=bq.func.range(self.start_date, self.end_date))
+        request = {'profit': factor}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(drop=False, inplace=True)
+        df.drop(columns='REVISION_DATE',inplace=True)
+        df['profit']=df.groupby('ID')['profit'].ffill()
+        # columns: REVISION_DATE,AS_OF_DATE,PERIOD_END_DATE,profit
+        df.rename(columns={
+            'ID':'sid',
+            'AS_OF_DATE':'date',
+            'PERIOD_END_DATE':'end_date',
+            'profit':'value'},
+                  inplace=True)        
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'profit')
+        # Format date
+        # df['date'] = df['date'].astype(str)
+        # df['date'] = df['date'].map(lambda x: str(x).replace('-','') if len(x)==10 else x)
+        # df.index = df['date']
+        # df.index.name = 'index' 
+        # df['date'] = df['date'].map(lambda x: str(x.date()).replace('-','') if len(str(x.date()))==10 else str(x.date()))
+        if 'Partial Errors' in df.columns:
+            df = df.drop(columns=['Partial Errors'])
+        df.dropna(inplace=True)
+        # df.reset_index(drop=True, inplace=True)
+        return df
+        
+    def get_factor_size(self) -> pd.DataFrame:
+        # factor = bq.data.cur_mkt_cap(dates=bq.func.range(self.start_date, self.end_date)).log()
+        factor = bq.data.cur_mkt_cap(dates=bq.func.range(self.start_date, self.end_date), currency=self.currency).log()
+        request = {'size': factor}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
+        df.drop_duplicates(inplace=True)
+        df.reset_index(drop=False, inplace=True)
+        # Rename and format columns
+        df = df[[f'DATE','ID','size']]
+        df['size'] = 1./df['size'] # low - high values
+        df.insert(1, 'factor_name', 'size')
+        df.rename(columns={
+            'DATE': 'date',
+            'ID': 'sid',
+            'size': 'value'
+        }, inplace=True)
+        df.dropna(inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def get_factor_shares_out_change(self) -> pd.DataFrame:
+        """
+        Retrieve change in shares outstanding for a list of securities over a backtest date range.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'shares_out'.
+                - value (float): Numeric value of last change in shares outstanding.
+        """
+        factor = 'shares_out_chg'
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        shares_out = bq.data.eqy_sh_out(fill='prev', dates=dates)
+        # shares_out =  bq.data.bs_sh_out(fill='prev', fpt='ltm', dates = dates)
+        request = {'shares_out': shares_out}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        df['shares_out'] = df.groupby('sid')['shares_out'].ffill()
+        df['shares_out_chg'] = df[['sid','shares_out']].groupby(['sid']).diff(1)
+        df['shares_out_chg'] = df['shares_out_chg'] / df['shares_out'].shift(1) # get pct change
+        df['shares_out_chg'].replace(0, np.nan, inplace=True)
+        df['shares_out_chg'] = df.groupby('sid')['shares_out_chg'].ffill().fillna(0.)
+        
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['shares_out_chg']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    def get_factor_value_v0(self) -> pd.DataFrame:
+        request = {'price': bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date)),
+                   'book':bq.data.BOOK_VAL_PER_SH(dates=bq.func.range(self.start_date, self.end_date))}; 
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        # Process results
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df = df[['DATE','PERIOD_END_DATE','price','book']].ffill()
+        if 'Partial Errors' in df.columns:
+            df = df.drop(columns=['Partial Errors'])
+        df['value'] = df['price']/df['book'] # 'price2book'
+        df.drop_duplicates(inplace=True)
+        df.reset_index(drop=False,inplace=True)
+        # Rename and format columns
+        df = df[[f'DATE','ID','value']]
+        df.insert(1, 'factor_name', 'value')
+        df.rename(columns={
+            'DATE': 'date',
+            'ID': 'sid',
+            'value': 'value'
+        }, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def get_factor_value(self) -> pd.DataFrame:
+        request = {'price': bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date)),
+                   'book':bq.data.BOOK_VAL_PER_SH(dates=bq.func.range(self.start_date, self.end_date))}; 
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        # Process results
+        df_price = res[0].df().reset_index()
+        df_book = res[1].df().reset_index()
+        df_book = df_book[['ID','REVISION_DATE','AS_OF_DATE','book']].dropna()
+        df_book.rename(columns={'AS_OF_DATE':'DATE'}, inplace=True)
+        df = df_price.merge(df_book[['ID','DATE','book']], how='left', on=['ID','DATE'])
+        df[['price','book']] = df.groupby('ID')[['price', 'book']].ffill()
+        
+        # df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        # df = df[['DATE','PERIOD_END_DATE','price','book']].ffill()
+        # if 'Partial Errors' in df.columns:
+        #     df = df.drop(columns=['Partial Errors'])
+        df['value'] = df['book']/df['price'] # 'price2book'
+        df.drop_duplicates(inplace=True)
+        # df.reset_index(drop=False,inplace=True)
+        # Rename and format columns
+        df = df[['DATE','ID','value']]
+        df.insert(1, 'factor_name', 'value')
+        df.rename(columns={
+            'DATE': 'date',
+            'ID': 'sid',
+            'value': 'value'
+        }, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def get_factor_momentum(self) -> pd.DataFrame:
+        """
+        Retrieve momentum for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'momentum'.
+                - value (float): value from beta field.
+        """
+        factor = 'momentum'
+        # if 'period' not in kwargs:
+        #     period = 12*30
+        # else:
+        #     period = kwargs.get('shift_lag')
+        period = 12*30
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        momentum = bq.data.momentum(dates=dates, period=period, fill='PREV')
+        request = {'momentum': momentum}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        
+        df['momentum'] = df.groupby('sid')['momentum'].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['momentum']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+    def get_factor_st_momentum(self) -> pd.DataFrame:
+        """
+        Retrieve momentum for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'momentum'.
+                - value (float): value from beta field.
+        """
+        factor = 'st_momentum'
+        period = 1*30
+
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        momentum = bq.data.momentum(dates=dates, period=period, fill='PREV')
+        request = {'momentum': momentum}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        
+        df['momentum'] = df.groupby('sid')['momentum'].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['momentum']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    def get_factor_buy_backs(self) -> pd.DataFrame:
+        """
+        Retrieve buy-backs as pct of shares outstanding for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'buy_backs'.
+                - value (float): value from buy-back percent calculation.
+        """
+        factor = 'buy_backs'
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        buy_backs = bq.data.share_buybacks(effective_date=dates)
+        shares_out =  bq.data.bs_sh_out(fill='prev', fpt='ltm', dates = dates)
+        request = {factor: buy_backs, 'shares_out': shares_out}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+
+        df_shares = res[1].df()
+        df_shares.reset_index(drop=False, inplace=True)
+        df_shares.rename(columns={'ID':'sid','AS_OF_DATE':'date'}, inplace=True)
+        df_shares = df_shares[['date','sid','shares_out']]
+        
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date','SHARES':'shares','AVG_PRICE':'avg_price'}, inplace=True)
+        df = df[['date','sid','avg_price','shares','buy_backs']]
+        df[factor] = df.groupby('sid')[factor].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+        df.dropna(inplace=True)
+
+        df = df_shares.merge(df, how='left', on=['date','sid'])
+        df['shares'] = df.groupby('sid')['shares'].ffill().fillna(0.)
+        df[factor] = df.groupby('sid')[factor].ffill().fillna(0.)
+
+        df['buy_backs_pct'] = df['shares'] / df['shares_out']
+        df['value'] = df['buy_backs_pct']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    def get_factor_momentum_v0(self, **kwargs) -> pd.DataFrame:
+        if 'shift_lag' not in kwargs:
+            shift_lag = int(252/12)
+        else:
+            shift_lag = kwargs.get('shift_lag')
+        # factor = bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date)).log()
+        start_date = str((datetime.strptime(self.start_date, '%Y-%m-%d') + timedelta(days = -shift_lag)).date())
+        # factor = bq.data.px_last(dates=bq.func.range(start_date, self.end_date))
+        factor = bq.data.px_last(dates=bq.func.range(start_date, self.end_date), currency=self.currency)
+        request = {'price': factor}
+        req = bql.Request(self.universe, request)
+        res = bq.execute(req)
+        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
+        df.reset_index(drop=False, inplace=True)
+        df.drop_duplicates(inplace=True)
+        df.sort_values(['ID','DATE'], inplace=True)
+        df['momentum'] = df.groupby(['ID'])['price'].pct_change(periods=shift_lag)
+
+        # Rename and format columns
+        df = df[[f'DATE','ID','momentum']]
+        df.insert(1, 'factor_name', 'momentum')
+        df.rename(columns={
+            'DATE': 'date',
+            'ID': 'sid',
+            'momentum': 'value'
+        }, inplace=True)
+        df.dropna(inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+        
+    def get_returns(self, bq) -> pd.DataFrame:
+        """Get returns data for the universe"""
+        try:
+            returns = bq.data.return_holding_period(dates=bq.func.range(self.start_date, self.end_date))
+            request = {'return': returns}
+            req = bql.Request(self.universe, request)
+            res = bq.execute(req)
+            
+            df_ret = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) 
+                              for x in res], axis=1)
+            df_ret.reset_index(drop=False, inplace=True)
+            
+            # Format DataFrame
+            df_ret = df_ret[['DATE', 'ID', 'return']]
+            df_ret.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+            df_ret.index = df_ret['date']
+            df_ret.index.name = 'index'
+            return df_ret
+            
+        except Exception as e:
+            raise Exception(f"Error getting returns data: {str(e)}")
+
+    def get_market_cap(self, bq) -> pd.DataFrame:
+        """Get market cap data for the universe"""
+        try:
+            mktcap = bq.data.market_cap(dates=bq.func.range(self.start_date, self.end_date))
+            request = {'mktcap': mktcap}
+            req = bql.Request(self.universe, request)
+            res = bq.execute(req)
+            
+            df_cap = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) 
+                              for x in res], axis=1)
+            df_cap.reset_index(drop=False, inplace=True)
+            
+            # Format DataFrame
+            df_cap = df_cap[['DATE', 'ID', 'mktcap']]
+            df_cap.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+            df_cap.index = df_cap['date']
+            df_cap.index.name = 'index'
+
+            # df_cap
+            # df_cap['date'] = df_cap['date'].astype(str)
+            # df_cap['date'] = df_cap['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
+            
+            return df_cap
+            
+        except Exception as e:
+            raise Exception(f"Error getting market cap data: {str(e)}")
+
+class BQLFactorAsync(BaseModel):
+    name: str
+    start_date: str
+    end_date: str
+    universe: List[str]
+    currency: Optional[str] = 'USD'
+    data: Optional[pd.DataFrame] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @field_validator('data', mode='before')
+    @classmethod
+    def validate_dataframe(cls, v: pd.DataFrame) -> pd.DataFrame:
+        if v is not None:
+            required_columns = {'date', 'factor_name', 'sid', 'value'}
+            if not all(col in v.columns for col in required_columns):
+                missing = required_columns - set(v.columns)
+                raise ValueError(f"Missing required columns: {missing}")
+        return v
+
+    # Async wrappers for sync methods            
+    async def fetch_rating_for_date(self, bq, idate: str):
+        rating_expr = bq.data.rating(dates=idate)
+        request = {'rating': rating_expr}
+        req = bql.Request(self.universe, request)
+        return await asyncio.to_thread(bq.execute, req)  # Convert sync to async
+
+    async def get_multiple_factors(self, bq, factors: List[str]) -> pd.DataFrame:
+        """Example method to run multiple factor retrievals in parallel"""
+        factor_methods = {
+            'size': self.get_factor_size,
+            'value': self.get_factor_value,
+            'momentum': self.get_factor_momentum,
+            'profit': self.get_factor_profit,
+            'short_interest': self.get_factor_short_interest,
+            'leverage': self.get_factor_leverage,
+            'earnings_yield': self.get_factor_earnings_yield,
+            'rating': self.get_factor_rating,
+            'beta': self.get_factor_beta
+        }
+
+        tasks = [factor_methods[factor](bq) for factor in factors if factor in factor_methods]
+        results = await asyncio.gather(*tasks)
+        return pd.concat(results, axis=0)
+
+    async def get_factor_data(self, bq,  factor_type: str = None, **kwargs) -> pd.DataFrame:
+        try:
+            if factor_type=='size':
+                df = await self.get_factor_size(bq)
+            elif factor_type=='value':
+                df = await self.get_factor_value(bq)
+            elif factor_type=='momentum':
+                df = await self.get_factor_momentum(bq)
+            elif factor_type=='profit':
+                df = await self.get_factor_profit(bq)
+            elif factor_type=='short_interest':
+                df = await self.get_factor_short_interest(bq)
+            elif factor_type=='leverage':
+                df = await self.get_factor_leverage(bq)
+            elif factor_type=='earnings_yield':
+                df = await self.get_factor_earnings_yield(bq)
+            elif factor_type=='beta':
+                df = await self.get_factor_beta(bq)
+            elif factor_type=='rating':
+                df = await self.get_factor_rating(bq)
+            elif factor_type=='shares_out_chg':
+                df = await self.get_factor_shares_out_change(bq)
+            elif factor_type=='buy_backs':
+                df = await self.get_factor_buy_backs(bq)
+            elif factor_type=='st_momentum':
+                df = await self.get_factor_st_momentum(bq)
+            elif factor_type=='pe_ratio':
+                df = await self.get_factor_pe_ratio(bq)
+            elif factor_type=='cfo_to_sales':
+                # import pdb; pdb.set_trace()
+                df = await self.get_factor_cfo_to_sales(bq)
+            else:
+                raise ValueError(f"Unsupported factor type: {factor_type}")
+            df.dropna(inplace=True)
+            df.index = df['date']
+            df.index.name = 'index' 
+            return df
+        except Exception as e:
+            raise Exception(f"Error getting factor data: {str(e)}")
+
+    async def get_factor_cfo_to_sales(self, bq) -> pd.DataFrame:
+        """
+        Retrieve CashFlow from Operations to Revenue (%) for a list of securities over a backtest date range.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'shares_out'.
+                - value (float): Numeric value of CF to Sales ratio.
+        """
+        factor = 'cfo_to_sales'
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        cfo_to_sales = bq.data.cfo_to_sales(FA_PERIOD_TYPE='Q', AS_OF_DATE=dates_daily) # calc_interval=dates_daily).dropna();
+        request = {'cfo_to_sales':cfo_to_sales};
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req) # res = bq.execute(req)
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','AS_OF_DATE':'date', 'REVISION_DATE':'revision_date', 'PERIOD_END_DATE':'period_end_date', factor:'value'}, inplace=True)
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(np.nan)
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_pe_ratio(self, bq) -> pd.DataFrame:
+        """
+        Retrieve PE ratios for a list of securities over a backtest date range.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'shares_out'.
+                - value (float): Numeric value of PE ratio.
+        """
+        factor = 'pe_ratio'
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        pe_ratio = bq.data.pe_ratio(FA_PERIOD_TYPE='Q', AS_OF_DATE=dates_daily) # calc_interval=dates_daily).dropna();
+        request = {'pe_ratio':pe_ratio};
+
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req) # res = bq.execute(req)
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','AS_OF_DATE':'date', 'REVISION_DATE':'revision_date', 'PERIOD_END_DATE':'period_end_date', factor:'value'}, inplace=True)
+
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(np.nan)
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_rating(self, bq) -> pd.DataFrame:
+        from random import randint
+
+        def fill_random(group):
+            median = group['value'].median()
+            mask = group['value'].isna()
+            group.loc[mask, 'value'] = np.random.randint(median - 1, median + 2, size=mask.sum())
+            return group
+
+        date_range = pd.date_range(start=self.start_date, end=self.end_date, freq='BM').strftime('%Y-%m-%d').tolist()
+
+        tasks = [self.fetch_rating_for_date(bq, d) for d in date_range]
+        results = await asyncio.gather(*tasks)
+
+        dfs = []
+        for res in results:
+            df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
+            df.reset_index(inplace=True)
+            df.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+            df['value'] = df['rating'].map(RATING_VALUE_MAP)
+            dfs.append(df)
+
+        df = pd.concat(dfs)
+        df = df.groupby('date', group_keys=False).apply(fill_random)
+        df = df[['date', 'sid', 'value']]
+        df.insert(1, 'factor_name', 'rating')
+        df['value'] = 1. / df['value']  # inverse quality
+
+        return df
+
+    async def get_factor_buy_backs(self, bq) -> pd.DataFrame:
+        """
+        Retrieve buy-backs as pct of shares outstanding for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'buy_backs'.
+                - value (float): value from buy-back percent calculation.
+        """
+        factor = 'buy_backs'
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        buy_backs = bq.data.share_buybacks(effective_date=dates)
+        shares_out =  bq.data.bs_sh_out(fill='prev', fpt='ltm', dates = dates)
+        request = {factor: buy_backs, 'shares_out': shares_out}
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req)
+
+        df_shares = res[1].df()
+        df_shares.reset_index(drop=False, inplace=True)
+        df_shares.rename(columns={'ID':'sid','AS_OF_DATE':'date'}, inplace=True)
+        df_shares = df_shares[['date','sid','shares_out']]
+        
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date','SHARES':'shares','AVG_PRICE':'avg_price'}, inplace=True)
+        df = df[['date','sid','avg_price','shares','buy_backs']]
+        df[factor] = df.groupby('sid')[factor].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+        df.dropna(inplace=True)
+
+        df = df_shares.merge(df, how='left', on=['date','sid'])
+        df['shares'] = df.groupby('sid')['shares'].ffill().fillna(0.)
+        df[factor] = df.groupby('sid')[factor].ffill().fillna(0.)
+
+        df['buy_backs_pct'] = df['shares'] / df['shares_out']
+        df['value'] = df['buy_backs_pct']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_shares_out_change(self, bq) -> pd.DataFrame:
+        """
+        Retrieve change in shares outstanding for a list of securities over a backtest date range.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'shares_out'.
+                - value (float): Numeric value of last change in shares outstanding.
+        """
+        factor = 'shares_out_chg'
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        shares_out = bq.data.eqy_sh_out(fill='prev', dates=dates)
+        # shares_out =  bq.data.bs_sh_out(fill='prev', fpt='ltm', dates = dates)
+        request = {'shares_out': shares_out}
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        df['shares_out'] = df.groupby('sid')['shares_out'].ffill()
+        df['shares_out_chg'] = df[['sid','shares_out']].groupby(['sid']).diff(1)
+        df['shares_out_chg'] = df['shares_out_chg'] / df['shares_out'].shift(1) # get pct change
+        df['shares_out_chg'].replace(0, np.nan, inplace=True)
+        df['shares_out_chg'] = df.groupby('sid')['shares_out_chg'].ffill().fillna(0.)
+        
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['shares_out_chg']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+    async def get_factor_momentum_v0(self, bq, shift_lag: int = 21) -> pd.DataFrame:
+        start_date = str((datetime.strptime(self.start_date, '%Y-%m-%d') - timedelta(days=shift_lag)).date())
+        factor = bq.data.px_last(dates=bq.func.range(start_date, self.end_date), currency=self.currency)
+        request = {'price': factor}
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req)
+
+        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
+        df.reset_index(inplace=True)
+        df.drop_duplicates(inplace=True)
+        df.sort_values(['ID', 'DATE'], inplace=True)
+        df['momentum'] = df.groupby('ID')['price'].pct_change(periods=shift_lag)
+        df = df[['DATE', 'ID', 'momentum']]
+        df.insert(1, 'factor_name', 'momentum')
+        df.rename(columns={'DATE': 'date', 'ID': 'sid', 'momentum': 'value'}, inplace=True)
+        df.dropna(inplace=True)
+        return df.reset_index(drop=True)
+
+    async def get_factor_st_momentum(self, bq) -> pd.DataFrame:
+        """
+        Retrieve momentum for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'momentum'.
+                - value (float): value from beta field.
+        """
+        factor = 'st_momentum'
+        period = 1*30
+
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        momentum = bq.data.momentum(dates=dates, period=period, fill='PREV')
+        request = {'momentum': momentum}
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        
+        df['momentum'] = df.groupby('sid')['momentum'].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['momentum']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_momentum(self, bq) -> pd.DataFrame:
+        """
+        Retrieve momentum for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'momentum'.
+                - value (float): value from beta field.
+        """
+        factor = 'momentum'
+        # if 'period' not in kwargs:
+        #     period = 12*30
+        # else:
+        #     period = kwargs.get('shift_lag')
+        period = 12*30
+
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        momentum = bq.data.momentum(dates=dates, period=period, fill='PREV')
+        request = {'momentum': momentum}
+        req = bql.Request(self.universe, request)
+        # res = bq.execute(req)
+        res = await asyncio.to_thread(bq.execute, req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        
+        df['momentum'] = df.groupby('sid')['momentum'].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['momentum']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_size(self, bq) -> pd.DataFrame:
+        factor = bq.data.cur_mkt_cap(dates=bq.func.range(self.start_date, self.end_date), currency=self.currency).log()
+        request = {'size': factor}
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req)
+        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
+        df.drop_duplicates(inplace=True)
+        df.reset_index(drop=False, inplace=True)
+        df.insert(1, 'factor_name', 'size')
+        df['size'] = 1./df['size'] # low - high values
+        df.rename(columns={'DATE': 'date', 'ID': 'sid', 'size': 'value'}, inplace=True)
+        df.dropna(inplace=True)
+        return df.reset_index(drop=True)
+
+    async def get_factor_value(self, bq) -> pd.DataFrame:
+        request = {
+            'price': bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date)),
+            'book': bq.data.BOOK_VAL_PER_SH(dates=bq.func.range(self.start_date, self.end_date))
+        }
+        req = bql.Request(self.universe, request)
+        res = await asyncio.to_thread(bq.execute, req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df = df[['DATE', 'PERIOD_END_DATE', 'price', 'book']].ffill()
+        df['value'] = df['price'] / df['book']
+        df.drop_duplicates(inplace=True)
+        df.reset_index(drop=False, inplace=True)
+        df = df[['DATE', 'ID', 'value']]
+        df.insert(1, 'factor_name', 'value')
+        df.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+        return df.reset_index(drop=True)
+
+    async def get_factor_beta_v0(self, bq) -> pd.DataFrame:
+        from itertools import product
+        factor = 'beta'
+        dates = bq.func.range(self.start_date, self.end_date, frq='M')
+        expr = bq.data.beta(dates=dates)
+        req1 = bql.Request(self.universe, {'beta': expr})
+        res1 = await asyncio.to_thread(bq.execute, req1)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res1], axis=1)
+        df.reset_index(inplace=True)
+        df.rename(columns={'DATE': 'date', 'ID': 'sid', 'beta': 'value'}, inplace=True)
+        df = df[['date', 'sid', 'value']]
+
+        # Add SPX dates for merging
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        px_last = bq.data.px_last(dates=dates_daily, frq='d', ca_adj='full').dropna()
+        req2 = bql.Request(['SPX Index'], {'price': px_last})
+        res2 = await asyncio.to_thread(bq.execute, req2)
+        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res2], axis=1)
+        df_price.reset_index(inplace=True)
+        df_price.columns = ['date', 'sid', 'price']
+        df_full = pd.DataFrame(product(df_price['date'].dropna().unique(), self.universe), columns=['date', 'sid'])
+        df = df_full.merge(df, how='left', on=['date', 'sid'])
+        df.sort_values(['sid', 'date'], inplace=True)
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(1.0)
+        df.drop_duplicates(['date', 'sid'], inplace=True)
+        df.insert(1, 'factor_name', factor)
+        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+
+    async def get_factor_beta_v1(self, bq) -> pd.DataFrame:
+        """
+        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'beta'.
+                - value (float): value from beta field.
+        """
+        factor = 'beta'
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        beta = bq.data.beta(dates=dates)
+        request = {'beta': beta}
+        req = bql.Request(self.universe, request)
+        # res = bq.execute(req)
+        res = await asyncio.to_thread(bq.execute, req)
+
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)        
+        
+        df['beta'] = df.groupby('sid')['beta'].ffill().fillna(1.)
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df['value'] = df['beta']
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_beta_v4(self, bq) -> pd.DataFrame:
+        """
+        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'beta'.
+                - value (float): value from beta field - use monthly betas and ffill intramonth.
+        """
+        factor = 'beta'
+        # daily data
+        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
+        px_last = bq.data.px_last(dates=dates_daily, frq='d', ca_adj='full').dropna();
+        request = {'price':px_last};
+        req = bql.Request(['SPX Index'], request);
+        # res = bq.execute(req);
+        res = await asyncio.to_thread(bq.execute, req)
+        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
+        df_price.reset_index(drop=False,inplace=True)
+        df_price.columns = ['date','sid','price']
+        df_price = pd.DataFrame(product(list(df_price.dropna().date.unique()), self.universe));
+        df_price.columns = ['date','sid'];
+        
+        # monthly data
+        dates = bq.func.range(self.start_date, self.end_date, frq='M')
+        beta = bq.data.beta(dates=dates)
+        request = {'beta': beta}
+        req = bql.Request(self.universe, request)
+        # res = bq.execute(req)
+        res = await asyncio.to_thread(bq.execute, req)
+        df = res[0].df()
+        df.reset_index(drop=False, inplace=True)
+        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)
+        
+        df['beta'] = df.groupby('sid')['beta'].ffill().fillna(1.)
+        df['value'] = df['beta']
+        df.sort_values(by=['sid', 'date'], inplace=True);
+
+        df = df_price.merge(df, how='left', on=['date','sid']);
+        df.sort_values(by=['sid', 'date'], inplace=True);
+        df['sid'] = df['sid'].ffill();
+        df['value'] = df.groupby('sid')['value'].ffill().fillna(1.);
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df.insert(1, 'factor_name', factor)
+        df = df[['date','factor_name','sid','value']]
+        return df
+
+    async def get_factor_beta(self, bq) -> pd.DataFrame:
+        """
+        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
+
+        Args:
+            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
+            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
+
+        Returns:
+            pd.DataFrame: A DataFrame with columns:
+                - date (pd.Timestamp): The date of the rating.
+                - sid (str): Security identifier.
+                - factor_name (str): 'beta'.
+                - value (float): value from beta field.
+        """
+        factor = 'beta'
+        n_days = 252+1;
+        start_date = datetime.strptime(self.start_date, "%Y-%m-%d")-timedelta(days=n_days);
+        start_date = start_date.strftime("%Y-%m-%d");
+        dates_daily = bq.func.range(start_date, self.end_date)
+
+        # benchmark returns
+        tot_return = bq.data.DAY_TO_DAY_TOT_RETURN_GROSS_DVDS(dates=dates_daily, per='D').dropna();
+        request = {'tot_return':tot_return};
+        req = bql.Request(['SPX Index'], request);
+        res = await asyncio.to_thread(bq.execute, req); # res = bq.execute(req);
+        df_ret_index = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
+        df_ret_index.reset_index(drop=False,inplace=True);
+        df_ret_index.columns = ['date','sid','index_return'];
+        
+        # universe returns
+        returns = bq.data.DAY_TO_DAY_TOT_RETURN_GROSS_DVDS(dates=dates_daily, per='D').dropna();
+        request = {'returns': returns};
+        req = bql.Request(self.universe, request);
+        res = bq.execute(req);
+        df_ret = res[0].df();
+        df_ret.reset_index(drop=False, inplace=True);
+        df_ret.rename(columns={'ID':'sid','DATE':'date'}, inplace=True);
+        df_ret = df_ret[['date','sid','returns']]
+
+        # merge data and run regression
+        df = compute_rolling_beta(df=df_ret, df_ret_index=df_ret_index, n_days=n_days, include_constant=True)
+        df = df.loc[df.date>self.start_date]
+
+        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
+        df.fillna(1.,inplace=True)
+        df.reset_index(drop=True, inplace=True);
+        df = df[['date','factor_name','sid','value']]
+        return df
+        
+    async def get_factor_leverage(self, bq) -> pd.DataFrame:
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        lt_borrow = bq.data.BS_LT_BORROW(fill='prev', dates=dates)
+        tot_assets = bq.data.BS_TOT_ASSET(fill='prev', fpt='ltm', dates=dates)
+        lev = (1. / lt_borrow / tot_assets) * 100.
+        lev = lev.replacenonnumeric(np.nan)
+        req = bql.Request(self.universe, {'leverage': lev})
+        res = await asyncio.to_thread(bq.execute, req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(inplace=True)
+        df['leverage'] = df.groupby('ID')['leverage'].ffill()
+        df.rename(columns={'ID': 'sid', 'AS_OF_DATE': 'date', 'leverage': 'value'}, inplace=True)
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'leverage')
+        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+
+    async def get_factor_profit(self, bq) -> pd.DataFrame:
+        factor = bq.data.normalized_profit_margin(dates=bq.func.range(self.start_date, self.end_date))
+        req = bql.Request(self.universe, {'profit': factor})
+        res = await asyncio.to_thread(bq.execute, req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(inplace=True)
+        df.drop(columns='REVISION_DATE', errors='ignore', inplace=True)
+        df['profit'] = df.groupby('ID')['profit'].ffill()
+        df.rename(columns={
+            'ID': 'sid', 'AS_OF_DATE': 'date',
+            'PERIOD_END_DATE': 'end_date', 'profit': 'value'
+        }, inplace=True)
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'profit')
+        if 'Partial Errors' in df.columns:
+            df = df.drop(columns=['Partial Errors'])
+        df.dropna(inplace=True)
+        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+
+    async def get_factor_short_interest(self, bq) -> pd.DataFrame:
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        short = bq.data.short_int(fill='prev', dates=dates)
+        shs_eqy = bq.data.eqy_sh_out(fill='prev', dates=dates)
+        shs_bs = bq.data.bs_sh_out(fill='prev', fpt='ltm', dates=dates)
+        shs = bq.func.max(shs_eqy, shs_bs)
+        si = (short / shs) * 100.
+        si = si.replacenonnumeric(np.nan)
+        req = bql.Request(self.universe, {'short_interest': si})
+        res = await asyncio.to_thread(bq.execute, req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(inplace=True)
+        df['short_interest'] = df.groupby('ID')['short_interest'].ffill()
+        df.rename(columns={'ID': 'sid', 'DATE': 'date', 'short_interest': 'value'}, inplace=True)
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'short_interest')
+        if 'Partial Errors' in df.columns:
+            df = df.drop(columns=['Partial Errors'])
+        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+
+    async def get_factor_earnings_yield(self, bq) -> pd.DataFrame:
+        dates = bq.func.range(self.start_date, self.end_date, frq='D')
+        earn_yield = bq.data.EARN_YLD(fill='prev', dates=dates)
+        earn_yield = earn_yield.replacenonnumeric(np.nan)
+        req = bql.Request(self.universe, {'earn_yield': earn_yield})
+        res = await asyncio.to_thread(bq.execute, req)
+        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
+        df.reset_index(inplace=True)
+        df['earn_yield'] = df.groupby('ID')['earn_yield'].ffill()
+        df.rename(columns={'ID': 'sid', 'AS_OF_DATE': 'date', 'earn_yield': 'value'}, inplace=True)
+        df.drop_duplicates(inplace=True)
+        df.insert(1, 'factor_name', 'earn_yield')
+        df['value'] = 1. / df['value']
+        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
 
 class YahooFactor(BaseModel):
     """
@@ -3220,6 +5257,60 @@ class EquityFactor(BaseModel):
         df.index.name = None
         return df
     
+    def normalize_optimal(
+        self,
+        method: Literal['zscore', 'rank', 'winsorize', 'percentile'] = 'zscore',
+        groupby: Optional[str] = None,
+        winsorize_limits: tuple = (0.01, 0.99)
+        ) -> pd.DataFrame:
+        """
+        Normalize factor values cross-sectionally using specified method.
+        
+        Args:
+            method: Normalization method ('zscore', 'rank', 'winsorize', 'percentile')
+            groupby: Optional column to group by before normalizing
+            winsorize_limits: Tuple of (lower, upper) percentile limits for winsorization
+            
+        Returns:
+            DataFrame with normalized values
+        """
+        df = self.data.copy()
+
+        # Define the function for each method
+        def zscore_fn(x):
+            return (x - x.mean()) / x.std(ddof=0)
+
+        def rank_fn(x):
+            return x.rank(pct=True)
+
+        def winsorize_fn(x):
+            lower, upper = x.quantile(winsorize_limits[0]), x.quantile(winsorize_limits[1])
+            clipped = x.clip(lower, upper)
+            return (clipped - clipped.mean()) / clipped.std(ddof=0)
+
+        def percentile_fn(x):
+            r = x.rank(pct=True)
+            return pd.Series(stats.norm.ppf(r), index=x.index)
+
+        method_map = {
+            'zscore': zscore_fn,
+            'rank': rank_fn,
+            'winsorize': winsorize_fn,
+            'percentile': percentile_fn,
+        }
+
+        if method not in method_map:
+            raise ValueError(f"Unsupported normalization method: {method}")
+
+        group_keys = ['factor_name']
+        if groupby:
+            group_keys.insert(0, groupby)
+
+        # Apply normalization
+        df['value'] = df.groupby(group_keys, group_keys=False)['value'].transform(method_map[method])
+
+        return df.sort_values(['sid', 'date'])
+
     def to_wide(self, value_column: str = 'value') -> pd.DataFrame:
         """
         Convert factor data to wide format with dates in rows and sids in columns.
@@ -3765,7 +5856,7 @@ def test_yahooFactor():
 def merge_weights_with_factor_loadings(
     df_weights: pd.DataFrame,
     df_factors: pd.DataFrame,
-    weight_col: str = "wgt",
+    weight_col: str = "weight",
     keep_weight_cols: Optional[Sequence[str]] = ("name", "exchange"),
     ) -> pd.DataFrame:
     """
@@ -3781,7 +5872,7 @@ def merge_weights_with_factor_loadings(
     df_factors : DataFrame
         Columns required: ['date','sid','factor_name','value'] for the entire universe at daily (or any) frequency.
     weight_col : str
-        Column in df_weights containing the portfolio weight (default 'wgt').
+        Column in df_weights containing the portfolio weight (default 'weight').
     keep_weight_cols : sequence of str or None
         Extra columns from df_weights to carry into the final output. Set to None to skip.
 
@@ -3870,6 +5961,95 @@ def merge_weights_with_factor_loadings(
 
     return df_weights_final
 
+def get_index_constituents(ticker: str) -> pd.DataFrame:
+    """
+    Fetches the constituent stocks for a given index ticker from Wikipedia.
+
+    Args:
+        ticker: The index ticker symbol (e.g., '^DJI', '^GSPC', '^NDX').
+
+    Returns:
+        A pandas DataFrame with the constituent data, or an empty
+        DataFrame if the ticker is not found or an error occurs.
+    """
+    # 1. Look up the ticker in our configuration map
+    config = INDEX_CONFIG.get(ticker)
+
+    # 2. If ticker is not in our map, return an empty DataFrame
+    if not config:
+        logging.warning(f"Ticker '{ticker}' not configured. Returning empty DataFrame.")
+        return pd.DataFrame()
+
+    url_name = config['url']
+    table_idx = config['table_index']
+
+    try:
+        # 3. Create the request with a User-Agent to avoid 403 Forbidden error
+        req = urllib.request.Request(
+            url_name, 
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+
+        # 4. Open the request and pass the file-like response to pandas
+        with urllib.request.urlopen(req) as response:
+            # pd.read_html returns a list of *all* tables on the page
+            all_tables = pd.read_html(response)
+
+        # 5. Select the correct table using the index from our config
+        constituents_df = all_tables[table_idx]
+        
+        logging.info(f"Successfully fetched {len(constituents_df)} constituents for {ticker}.")
+        return constituents_df
+
+    except urllib.error.HTTPError as e:
+        # Handle web errors (e.g., 404 Not Found, 500 Server Error)
+        logging.error(f"HTTP Error for {ticker} at {url_name}: {e}")
+        return pd.DataFrame()
+    except IndexError:
+        # Handle if the page structure changed and our table_index is wrong
+        logging.error(f"Error: Table index {table_idx} not found for {ticker} at {url_name}.")
+        return pd.DataFrame()
+    except Exception as e:
+        # Handle any other unexpected errors
+        logging.error(f"An unexpected error occurred for {ticker}: {e}")
+        return pd.DataFrame()
+
+# Config ID function
+def default_json_encoder(o):
+    import datetime
+    if isinstance(o, (datetime.date, datetime.datetime)):
+        return o.isoformat()
+    if isinstance(o, Decimal):
+        return float(o)  # or str(o) if you want to preserve exact value
+    raise TypeError(f'Object of type {o.__class__.__name__} is not JSON serializable')
+
+def generate_config_id(config: dict, prefix: Optional[str] = None) -> str:
+    """
+    Generate a deterministic, unique config_id for a given configuration dictionary.
+    
+    Args:
+        config (dict): The configuration dictionary (should be serializable).
+        prefix (str, optional): Optional prefix for readability (e.g., 'yahoo', '20240601').
+    
+    Returns:
+        str: A unique, deterministic config_id.
+    """
+    import hashlib
+    import json
+    from datetime import datetime
+
+    # Serialize config to JSON with sorted keys for consistency
+    config_json = json.dumps(config, sort_keys=True, separators=(',', ':'), default=default_json_encoder)
+    # Hash the JSON string
+    config_hash = hashlib.sha256(config_json.encode('utf-8')).hexdigest()[:12]  # Shorten for readability
+    # Optionally add a prefix (e.g., data source, date)
+    if prefix:
+        config_id = f"{prefix}_{config_hash}"
+    else:
+        config_id = config_hash
+    return config_id
+
+
 # Example usage:
 if __name__ == "__main__":
     # Configure logging to see outputs
@@ -3880,8 +6060,6 @@ if __name__ == "__main__":
         )
     # test_yahooFactor()
     
-    update_history = False # True | False
-
     cfg = FileConfig()
     mgr = FileDataManager(cfg)
 
@@ -3895,12 +6073,14 @@ if __name__ == "__main__":
                 RiskFactors.VALUE, 
                 RiskFactors.BETA
                 ],
+            sector_neutral=False,
+            # sector_classification='GICS',
             bench_weights=None,
             n_buckets=5
         ),
         backtest=BacktestConfig(
             data_source = DataSource.YAHOO, # 'yahoo',
-            universe=Universe.INDU,  # Universe.INDU: Dow Jones Industrial Average # 'SEMLMCUP Index', 'NDX Index'
+            universe=Universe.SPX,  # Universe.INDU: Dow Jones Industrial Average # 'SEMLMCUP Index', 'NDX Index'
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
             start='2023-12-31', # '2023-12-31',
@@ -3914,7 +6094,7 @@ if __name__ == "__main__":
             periods=10
         ),
         export=ExportConfig(
-            update_history = False,
+            update_history = False, # bool
             base_path="./data/time_series",
             s3_config={
                 'bucket_name': os.environ.get('CLOUD_USER_BUCKET'),
@@ -3922,33 +6102,30 @@ if __name__ == "__main__":
             }
         )
     )
-    # Get portfolio turnover dates
-    # dates_turnover = get_rebalance_dates(model_input, return_as='str')
-    # model_input.backtest.dates_turnover = dates_turnover
+
+    update_history = model_input.export.update_history
+
+    # Get portfolio turnover dates: model_input.backtest.dates_turnover
     set_model_input_dates_turnover(model_input)
 
     # Validate and access the config
     print(model_input.model_dump_json(indent=2))
 
-    # Get daily business dates
-    # dates_daily = get_rebalance_dates(model_input, return_as='str', frq=Frequency.DAILY)
-    # model_input.backtest.dates_daily = dates_daily
-    # n_dates = len(model_input.backtest.dates_daily) # len(dates)
-    # model_input.params.n_dates = n_dates
-    # print(f"\nNumber of days in backtest is: {n_dates}")
+    # Get daily business dates: model_input.backtest.dates_daily; len(model_input.backtest.dates_daily)
     set_model_input_dates_daily(model_input)
+    print(f"\nNumber of days in backtest is: {model_input.params.n_dates}")
 
     # Get European indices
-    europe_indices = Universe.get_by_region('Europe')
-    print("European Indices:")
-    for name, desc in europe_indices.items():
-        print(f"{name}: {desc}")
+    # europe_indices = Universe.get_by_region('Europe')
+    # print("European Indices:")
+    # for name, desc in europe_indices.items():
+    #     print(f"{name}: {desc}")
         
-    # Get technical factors
-    technical_factors = RiskFactors.get_by_category('Technical')
-    print("Technical Indicators:")
-    for name, desc in technical_factors.items():
-        print(f"{name}: {desc}")
+    # # Get technical factors
+    # technical_factors = RiskFactors.get_by_category('Technical')
+    # print("Technical Indicators:")
+    # for name, desc in technical_factors.items():
+    #     print(f"{name}: {desc}")
 
     """
     # Get security master object
@@ -3962,24 +6139,30 @@ if __name__ == "__main__":
     if update_history:
         df_benchmark_prices = security_master.get_benchmark_prices()
     else:
-        # df_benchmark_prices = file_load_benchmark_prices(model_input)
         df_benchmark_prices = mgr.load_prices(identifier)
+        security_master.df_bench = df_benchmark_prices
     print("\nSecurity Master Benchmark Prices:")
-    print(df_benchmark_prices) # security_master.df_bench.tail(3)
+    print(df_benchmark_prices.tail(3))
 
     # Get benchmark members' weights
     if update_history:
         df_benchmark_weights = security_master.get_benchmark_weights()
     else:
-        # df_benchmark_weights = file_load_benchmark_weights(model_input)
         df_benchmark_weights = mgr.load_benchmark_weights(identifier)
-
+        security_master.weights_data = df_benchmark_weights
+        # Ensure 'weight' column exists (backward compatibility: convert 'wgt' to 'weight' if needed)
+        if 'wgt' in df_benchmark_weights.columns and 'weight' not in df_benchmark_weights.columns:
+            df_benchmark_weights['weight'] = df_benchmark_weights['wgt']
+            df_benchmark_weights.drop(columns=['wgt'], inplace=True)
+        elif 'wgt' in df_benchmark_weights.columns and 'weight' in df_benchmark_weights.columns:
+            # Both exist, drop 'wgt' and keep 'weight'
+            df_benchmark_weights.drop(columns=['wgt'], inplace=True)
     print("\nBenchmark Weights Sample:")
     print(df_benchmark_weights.tail(3))
 
     # Get portfolios: NOTE -> should be generated by another program and follow format below:
-    # index         date       ticker  sid  exchange  sector     weight    wgt
-    # 2025-03-31  2025-03-31   WMT     WMT  NYSE      Retailing  0.033333  0.013508
+    # index         date       ticker  sid  exchange  sector     weight
+    # 2025-03-31  2025-03-31   WMT     WMT  NYSE      Retailing  0.033333
     df_portfolio = security_master.get_portfolio(model_input)
     model_input.backtest.portfolio_list = sorted(list(df_portfolio['sid'].unique()))
     print("\nSecurity Master Portfolio:")
@@ -3996,8 +6179,8 @@ if __name__ == "__main__":
     if update_history:
         df_prices = security_master.get_members_prices(model_input)
     else:
-        # df_prices = file_load_prices(model_input)
         df_prices = mgr.load_prices(identifier+'_members')
+        security_master.df_price = df_prices
 
     print("\nSecurity Master Benchmark Members' Prices:")
     print(df_prices.tail(3)) # security_master.df_price.tail()
@@ -4029,17 +6212,16 @@ if __name__ == "__main__":
     if update_history:
         df_ret_long = security_master.get_returns_long()
     else:
-        # df_ret_long = file_load_returns(model_input)
         df_ret_long = mgr.load_returns(identifier+'_members')
 
     print("\nUniverse Members' returns - long format:")
-    print(df_ret_long.tail(2))
+    print(df_ret_long.tail(3))
 
     # get returns wide format
     if update_history:
         df_ret_wide = security_master.get_returns_wide()
         print("\nUniverse Members' returns - wide format:")
-        print(df_ret_wide.tail(2))
+        print(df_ret_wide.tail(3))
     else:
         df_ret_wide = df_ret_long[['date','sid','return']].pivot(
             index='date', columns='sid', values='return')
@@ -4049,6 +6231,7 @@ if __name__ == "__main__":
     # Instantiate factor classes & get data
     """
     factor_list = [i.value for i in model_input.params.risk_factors] # ['momentum','beta','size','value']
+    print("\nFactors in Model:")
     print(factor_list)
 
     if 'factor_dict' not in locals():
@@ -4064,11 +6247,11 @@ if __name__ == "__main__":
                 )
                     
             # Get factor data
-            # factor_data[factor_name] = factor.get_factor_data()
             factor_df = factor.get_factor_data()
 
             if df_benchmark_weights.shape[0]>0:
                 factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+                factor_df = factor_df[['date','factor_name','sid','value']]
 
             # Create EquityFactor instance
             factor_eq = EquityFactor(
@@ -4096,13 +6279,13 @@ if __name__ == "__main__":
 
             # Print results
             print("\nSummary Statistics:")
-            print(df_stats.tail(2))
+            print(df_stats.tail(3))
 
             print("\nAutocorrelation:")
             print(autocorr)
 
             print("\nCoverage Statistics:")
-            print(coverage.tail(2))
+            print(coverage.tail(3))
 
             results = factor_eq.analyze_factor_returns(
                 returns_data=df_ret_long,
@@ -4132,7 +6315,6 @@ if __name__ == "__main__":
         # factor_eq.plot_cumulative_returns(df_ret_long, n_buckets=model_input.params.n_buckets, shift_lag=1)
     else:
         # Read factor data
-        # factor_data_dict = file_load_factors(model_input)
         factor_data_dict = {}
         for factor in model_input.params.risk_factors:
             factor_name = factor.value
@@ -4144,9 +6326,9 @@ if __name__ == "__main__":
             print(f"Running model for factor: {factor_type}")
             factor_df = factor_data_dict.get(factor_type)
 
-
-            # if df_benchmark_weights.shape[0]>0:
-            #     factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+            if df_benchmark_weights.shape[0]>0:
+                factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+                factor_df = factor_df[['date','factor_name','sid','value']]
 
             # Create EquityFactor instance
             factor_eq = EquityFactor(
@@ -4166,7 +6348,6 @@ if __name__ == "__main__":
                 neutralize_size=False,
                 shift_lag=1
             )
-            # results[factor_type] = results
 
             factor_dict[factor_type] = {
                 'factor': None, # factor,
@@ -4186,7 +6367,6 @@ if __name__ == "__main__":
     if update_history:
         df_exposures = pd.DataFrame()
         for factor in factor_dict.keys():
-            # factor = 'beta'
             df = factor_dict.get(factor).get('factor_eq').normalize(groupby='date', method='winsorize')[['date','sid','value']].copy() # 'zscore'
             df.rename(columns={'value':factor}, inplace=True)
             df.sort_values(['sid','date'], inplace=True)
@@ -4204,7 +6384,6 @@ if __name__ == "__main__":
         df_exposures_long.rename(columns={'sid':'security_id'},inplace=True)
         df_exposures_long.insert(1, 'universe', model_input.backtest.universe.value)
     else:
-        # df_exposures_long = file_load_exposures(model_input)
         df_exposures_long = mgr.load_exposures(identifier+'_members')
         df_exposures = df_exposures_long[['date','sid','variable','exposure']].pivot(
             index=['date','sid'], columns='variable', values='exposure').reset_index(drop=False)
@@ -4217,9 +6396,13 @@ if __name__ == "__main__":
     """
     # Get pure factor returns: TO DO -> add this to app_factors_test.py PURE_FACTOR optimization
     """
-
-    # import qBacktest as bt
     print(f"\nFactors in Model: {factor_list}")
+    df_volume = security_master.get_volume_long(n_window=22)
+    # print(df_volume.query(f"date < '{str(df_volume.date.max().date())}'").groupby(['sid']).tail(1).dropna().sort_values(['volume_mm_avg'], ascending=False))
+
+    model_input.params.sector_neutral = False # change to True if sector neutral pure portfolios
+    dummy_name = 'custom' # -> sector, industry, sub_industry
+    sector_dummies = security_master.get_sector_dummies(dummy_name=dummy_name) if model_input.params.sector_neutral else pd.DataFrame()
 
     df_pure_return = pd.DataFrame()
     df_pure_portfolio = pd.DataFrame()
@@ -4227,22 +6410,42 @@ if __name__ == "__main__":
     for factor in factor_list: # ['beta']
         
         # Create optimization constraints
+        # constraints = PurePortfolioConstraints(
+        #     long_only=False,
+        #     full_investment=True,
+        #     factor_neutral=[i for i in factor_list if i!=factor],
+        #     weight_bounds=(-0.05, 0.05),
+        #     min_holding=0.01
+        # )
+
+        # # Initialize optimizer
+        # optimizer_pure = PureFactorOptimizer(
+        #     target_factor=factor,
+        #     constraints=constraints,
+        #     normalize_weights=True,
+        #     parallel_processing=False
+        # )
         constraints = PurePortfolioConstraints(
             long_only=False,
-            full_investment=True,
-            factor_neutral=[i for i in factor_list if i!=factor],
+            full_investment=False,
+            unit_target_exposure=True,
+            factor_neutral=[f for f in factor_list if f != factor],
             weight_bounds=(-0.05, 0.05),
-            min_holding=0.01
+            factor_bounds=(-0.025, 0.025),
+            sector_bounds=(-0.025, 0.025),
+            # min_holding=0.01,
+            sector_neutral=model_input.params.sector_neutral,
+            soft_factor_neutrality_strength=0., # > 0 soft
+            max_turnover=0.02, # max_turnover=0.02,  # OR turnover_penalty_strength=5.0
+            max_names=None # None if not used, tried with 30, 60
         )
 
-        # Initialize optimizer
         optimizer_pure = PureFactorOptimizer(
             target_factor=factor,
             constraints=constraints,
-            normalize_weights=True,
+            normalize_weights=False,
             parallel_processing=False
         )
-
         # Run optimization (example data not provided)
         # results = optimizer.optimize(returns, exposures, dates)
         results_opt = optimizer_pure.optimize(
@@ -4267,8 +6470,6 @@ if __name__ == "__main__":
         df_ret_opt = backtest.df_pnl.copy()
 
         print(f"{factor.upper()} Factor Return & Sharpe : {results_bt.cumulative_return_benchmark:.2%}, {results_bt.sharpe_ratio_benchmark:.2f}")
-        # df_ret_opt = get_backtest(df_ret_long, df_portfolio, lag=1, flag_plot=False)
-        # df_ret_opt.insert(0, 'factor', factor.lower())
             
         df_pure_return = pd.concat([df_pure_return, df_ret_opt])
         df_pure_portfolio = pd.concat([df_pure_portfolio, df_portfolio])
@@ -4279,5 +6480,20 @@ if __name__ == "__main__":
     plt.savefig(f"plot_pure_factor_returns_{identifier}.png")
     print(df_pure_return_wide.corr())
     print(252*df_pure_return_wide.mean())
-    # df_pure_return_wide.reset_index(drop=False, inplace=True)
-    # print(df_pure_return_wide.info())
+    
+    # Return aggregator
+    from utils import FactorReturnAggregator
+    df = df_pure_return_wide.copy()
+    
+    agg = FactorReturnAggregator(data=df, trading_days_per_year=252)
+    
+    weekly = agg.aggregate_weekly()      # compounded weekly returns
+    monthly = agg.aggregate_monthly()    # compounded monthly returns
+    yearly = agg.aggregate_yearly()      # compounded yearly returns
+    
+    stats_daily   = agg.stats_daily(rf_annual=0.02)
+    stats_weekly  = agg.stats_weekly(rf_annual=0.02)
+    stats_monthly = agg.stats_monthly(rf_annual=0.02)
+    stats_yearly  = agg.stats_yearly(rf_annual=0.02)
+
+    print(monthly.round(3).tail())

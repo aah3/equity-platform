@@ -16,6 +16,8 @@ import statsmodels.api as sm
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 # from src.qRegime import *
+import qBacktest as bt
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -55,7 +57,7 @@ class OptimizationResult(BaseModel):
     class Config:
         arbitrary_types_allowed = True
         
-class PurePortfolioConstraints(BaseModel):
+class PurePortfolioConstraints_v1(BaseModel):
     """Portfolio constraints configuration"""
     long_only: bool = False
     full_investment: bool = True
@@ -71,7 +73,31 @@ class PurePortfolioConstraints(BaseModel):
             raise ValueError("Lower bound must be less than upper bound")
         return v
 
-class PureFactorOptimizer(BaseModel):
+class PurePortfolioConstraints(BaseModel):
+    """Portfolio constraints configuration"""
+    long_only: bool = False
+    full_investment: bool = True
+    unit_target_exposure: bool = False
+    factor_neutral: List[str] = Field(default_factory=list)
+    # factor_bounds: Dict[str, Tuple[float, float]] = Field(default_factory=dict)
+    factor_bounds: Tuple[float, float] = (-0.05, 0.05)
+    weight_bounds: Tuple[float, float] = (-0.05, 0.05)
+    sector_bounds: Tuple[float, float] = (-0.05, 0.05)
+    min_holding: float = 0.01
+    max_names: Optional[int] = None
+    sector_neutral: Optional[bool] = None
+    soft_factor_neutrality_strength: Optional[float] = 1.1  # 0 = hard constraint, >0 = soft penalty
+    max_turnover: Optional[float] = None   # Hard constraint, e.g. 0.1 = 10%
+    turnover_penalty_strength: Optional[float] = None  # Soft penalty, e.g. 10.0
+
+    @field_validator('weight_bounds')
+    def validate_weight_bounds(cls, v):
+        if v[0] > v[1]:
+            raise ValueError("Lower bound must be less than upper bound")
+        return v
+
+
+class PureFactorOptimizer_v1(BaseModel):
     """Pure factor portfolio optimization implementation"""
     target_factor: str
     constraints: PurePortfolioConstraints
@@ -293,7 +319,379 @@ class PureFactorOptimizer(BaseModel):
                     
         return {'meta_data':results_data, # pd.DataFrame(results_data), 
                 'weights_data':weights_data}
+
+class PureFactorOptimizer(BaseModel):
+    """Pure factor portfolio optimization implementation"""
+    target_factor: str
+    constraints: PurePortfolioConstraints
+    normalize_weights: bool = True
+    parallel_processing: bool = False # True
+    max_workers: int = 4
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _setup_optimization_problem(
+        self,
+        returns: pd.DataFrame,
+        exposures: pd.DataFrame,
+        sector_dummies: pd.DataFrame,
+               constraints: PurePortfolioConstraints,
+        prev_weights: Optional[np.ndarray] = None
+    ) -> Tuple[cp.Problem, cp.Variable]:
+        """Set up the CVXPY optimization problem"""
+        n_assets = returns.shape[1]
+        w = cp.Variable(n_assets)
+
+        # Initialize constraints list
+        constraint_list = []
+
+        # Basic constraints
+        if constraints.full_investment:
+            constraint_list.append(cp.sum(w) == 0)
+                    
+        if constraints.long_only:
+            constraint_list.append(w >= 0)
+        else:
+            constraint_list.append(w >= constraints.weight_bounds[0])
+            constraint_list.append(w <= constraints.weight_bounds[1])
+            
+        # Factor neutrality constraints
+        if sector_dummies.shape[0] == n_assets:
+            sector_exposure = w @ sector_dummies
+            constraint_list.extend([
+                sector_exposure >= constraints.sector_bounds[0],
+                sector_exposure <= constraints.sector_bounds[1]
+            ])
+        
+        # Factor neutrality
+        penalty = 0.0
+        if False:
+            # Strict neutrality
+            for factor in constraints.factor_neutral:
+                if factor != self.target_factor:
+                    constraint_list.append(w @ exposures[factor] == 0)
+        else:
+            # Soft neutrality
+            for factor in constraints.factor_neutral:
+                if factor != self.target_factor:
+                    if constraints.soft_factor_neutrality_strength > 0:
+                        penalty += constraints.soft_factor_neutrality_strength * cp.square(w @ exposures[factor])
+                    else:
+                        # constraint_list.append(w @ exposures[factor] == 0)
+                        constraint_list.append(w @ exposures[factor] >= constraints.factor_bounds[0])
+                        constraint_list.append(w @ exposures[factor] <= constraints.factor_bounds[1])
+
+        # Factor bound constraints
+        # for factor, (lower, upper) in constraints.factor_bounds.items():
+        #     if factor != self.target_factor:
+        #         factor_exposure = w @ exposures[factor]
+        #         constraint_list.extend([
+        #             factor_exposure >= lower,
+        #             factor_exposure <= upper
+        #         ])
+                
+        # Turnover constraint or penalty
+        if prev_weights is not None:
+            delta = w - prev_weights
+
+            if constraints.max_turnover is not None:
+                constraint_list.append(cp.norm1(delta) <= constraints.max_turnover)
+
+            if constraints.turnover_penalty_strength is not None:
+                penalty += constraints.turnover_penalty_strength * cp.norm1(delta)
+
+        # Maximum number of positions constraint
+        if constraints.max_names is not None:
+            z = cp.Variable(n_assets, boolean=True)
+            M = constraints.weight_bounds[1]  # Upper bound on absolute weight
+            # If |w_i| ≥ min_holding → z_i must be 1
+            # So force: |w_i| ≤ M * z_i
+            constraint_list.append(cp.abs(w) <= M * z)
+            constraint_list.append(cp.sum(z) <= constraints.max_names)
+        
+        # unit exposure to factor
+        if constraints.unit_target_exposure:
+            constraint_list.append(w @ exposures[self.target_factor] <= 1)
+            constraint_list.append(w @ exposures[self.target_factor] >= 0.75)
+
+        # Objective: Maximize exposure to target factor
+        if isinstance(penalty, float):
+            objective = cp.Maximize(w @ exposures[self.target_factor])
+        else:
+            # print('Adding penalty to the objective...')
+            objective = cp.Maximize((w @ exposures[self.target_factor]) - penalty)
+
+        return cp.Problem(objective, constraint_list), w
+
+    def _normalize_portfolio(self, weights: np.ndarray) -> np.ndarray:
+        """Normalize portfolio weights to maintain dollar neutrality"""
+        if not self.normalize_weights:
+            return weights
+
+        positive_sum = np.sum(weights[weights > 0])
+        negative_sum = np.abs(np.sum(weights[weights < 0]))
+        scaling_factor = max(positive_sum, negative_sum)
+
+        if scaling_factor > 0:
+            return weights / scaling_factor
+        return weights
+
+    def _optimize_single_period(
+        self,
+        date: str,
+        returns: pd.DataFrame,
+        exposures: pd.DataFrame,
+        sector_dummies: pd.DataFrame,
+        universe: List[str],
+        prev_weights: Optional[pd.Series] = None
+    ) -> OptimizationResult:
+        """Optimize portfolio for a single period"""
+        try:
+            start_time = pd.Timestamp.now()
+ 
+            # Set up and solve optimization problem
+            prev_weights_array = None
+            if prev_weights is not None:
+                prev_weights_array = prev_weights.reindex(universe).fillna(0).values
+
+            prob, w = self._setup_optimization_problem(
+                returns,
+                exposures,
+                sector_dummies,
+                self.constraints,
+                prev_weights=prev_weights_array
+            )
+
+            # prob, w = self._setup_optimization_problem(returns, exposures, sector_dummies, self.constraints)
+            try:
+                prob.solve(solver=cp.CLARABEL, verbose=False)
+            except:
+                prob.solve(solver=cp.SCIP, verbose=False)
+
+            if prob.status not in ["optimal", "optimal_inaccurate"]:
+                return OptimizationResult(
+                    date=date,
+                    status=OptimizationStatus.INFEASIBLE,
+                    error_message=f"Optimization status: {prob.status}"
+                )
+
+            # Process results
+            weights = self._normalize_portfolio(w.value)
+            # weights = w.value
+            weights_series = pd.Series(weights, index=universe)
+
+            # Calculate factor exposures
+            # factor_exposures = {
+            #     factor: (np.array(weights_series) @ exposures[factor])
+            #     for factor in exposures.columns
+            #     if factor != 'sid'
+            # }
+            factor_exposures = np.array(weights_series) @ exposures[[factor for factor in exposures.columns if factor not in ['sid','date']]]
+            # print(date); print(factor_exposures)
+            factor_exposures = factor_exposures.to_dict()
+            
+            # Sector exposures
+            sector_exposures = {}
+            if sector_dummies.shape[0] > 0:
+                sector_exposures = (np.array(weights_series) @ sector_dummies).to_dict()
+            # sector_exposures = np.array(weights_series) @ sector_dummies
+            # sector_exposures = sector_exposures.to_dict()
+
+            return OptimizationResult(
+                date=date,
+                status=OptimizationStatus.SUCCESS,
+                target_factor=self.target_factor,
+                weights=weights_series,
+                objective_value=prob.value,
+                factor_exposures=factor_exposures,
+                sector_exposures=sector_exposures,
+                optimization_time=(pd.Timestamp.now() - start_time).total_seconds()
+            )
+
+        except Exception as e:
+            logger.error(f"Optimization failed for date {date}: {str(e)}")
+            return OptimizationResult(
+                date=date,
+                status=OptimizationStatus.FAILED,
+                error_message=str(e)
+            )
+
+    def optimize(
+        self,
+        returns: pd.DataFrame,
+        exposures: pd.DataFrame,
+        dates: List[str],
+        sector_dummies: pd.DataFrame = pd.DataFrame(),
+        lookback_periods: int = 3,
+        add_turn_over: Optional[bool] = False
+        
+    ) -> pd.DataFrame:
+        """
+        Run optimization across multiple periods
+
+        Parameters:
+        -----------
+        returns : pd.DataFrame
+            Asset returns matrix
+        exposures : pd.DataFrame
+            Factor exposures dataframe
+        dates : List[str]
+            List of dates to optimize for
+        lookback_periods : int
+            Number of periods to use for return calculation
+
+        Returns:
+        --------
+        pd.DataFrame
+            Optimized portfolio weights and metrics
+        """
+        results = []
+        if not isinstance(returns.index[0], str):
+            returns.index = [str(i) for i in returns.index]
+        if not isinstance(exposures.date[0], str):
+            exposures['date'] = exposures['date'].astype(str)
+        # def process_date(date):
+        def process_date(date, prev_weights: Optional[pd.Series] = None):
+            # Get universe and exposures for current date
+            # current_exposures = exposures[exposures['date'] == date.replace('-','')].copy()
+            current_exposures = exposures[exposures['date'] == str(date)].copy()
+            current_exposures['date'] = pd.to_datetime(current_exposures['date']).dt.date
+            universe = current_exposures['sid'].tolist()
+
+            # Get historical returns
+            date_idx = dates.index(date)
+            start_idx = max(0, date_idx - lookback_periods)
+            historical_returns = returns.loc[dates[start_idx]:date][universe].fillna(0)
+            
+            # Get dummies for sectors
+            df_dummies = sector_dummies.copy()
+            if df_dummies.shape[0]>0:
+                sector_names = list(df_dummies.columns)
+                df_dummies = current_exposures[['date','sid']].merge(
+                    df_dummies.reset_index(drop=False).rename(columns={'index':'sid'}), 
+                    how='left', 
+                    on='sid')
+                df_dummies = df_dummies[sector_names]
+
+            # Run optimization
+            result = self._optimize_single_period(
+                date = str(date),
+                returns = historical_returns,
+                exposures = current_exposures,
+                sector_dummies = df_dummies,
+                universe = universe,
+                prev_weights = prev_weights
+            )
+            return result
+
+        if self.parallel_processing:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                optimization_results = list(executor.map(process_date, dates))
+        else:
+            # optimization_results = [process_date(date) for date in dates]
+            optimization_results = []
+            prev_weights = None
+
+            for date in dates:
+                result = process_date(date, prev_weights)
+
+                if (result.status == OptimizationStatus.SUCCESS) & add_turn_over:
+                    prev_weights = result.weights.copy()
+                else:
+                    prev_weights = None  # Reset if failure (conservative fallback)
+
+                optimization_results.append(result)
+                # print(result.factor_exposures)
+
+        # Convert results to DataFrame
+        results_data = pd.DataFrame()
+        weights_data = pd.DataFrame()
+        for result in optimization_results:
+            if result.status == OptimizationStatus.SUCCESS:
+                row_data = {
+                    'date': result.date, # .replace('-',''),
+                    'status': result.status,
+                    'target_factor':result.target_factor,
+                    'objective_value': result.objective_value,
+                    'optimization_time': result.optimization_time
+                }
+
+                # Add factor exposures
+                for factor, exposure in result.factor_exposures.items():
+                    row_data[f'exposure_{factor}'] = exposure
+                    
+                # Add sector exposures
+                if hasattr(result, 'sector_exposures') and result.sector_exposures:
+                    for sector, exposure in result.sector_exposures.items():
+                        row_data[f'exposure_sector_{sector}'] = exposure
+
+                # results_data.append(row_data)
+                results_data = pd.concat([results_data, 
+                                          pd.DataFrame(row_data, index=[result.date])])
+
+                # Add weights
+                df = result.weights.reset_index(drop=False)
+                df.columns = ['sid','weight']
+                df.insert(0, 'pfactor', result.target_factor)
+                df.insert(0, 'date', result.date) # .replace('-','')
+                if not isinstance(exposures['date'][0],str):
+                    df['date'] = pd.to_datetime(df['date'])
+                df = df.merge(exposures, how='left', on=['date','sid'])
+                df.index = df['date']
+                df.index.name = 'index'
+                weights_data = pd.concat([weights_data, 
+                                          df])
+                # for sid, weight in result.weights.items():
+                #     row_data[f'{sid}'] = weight
+                #     weights_data.append([sid, weight])
+                    
+        return {'meta_data':results_data, # pd.DataFrame(results_data), 
+                'weights_data':weights_data}
+
+def run_pure_factor_optimization(
+    factor: str,
+    returns: pd.DataFrame = pd.DataFrame(),
+    exposures: pd.DataFrame = pd.DataFrame(),
+    sector_dummies: pd.DataFrame = pd.DataFrame(),
+    dates: List[str] = [],
+    optimizer: PureFactorOptimizer = None,
+    add_turn_over: Optional[bool] = False) -> Tuple[pd.DataFrame, pd.DataFrame, bt.BacktestResults]:
     
+    """Run optimization and backtest for a single factor"""
+
+    
+    returns_wide = returns[['date','sid','return']].pivot(index='date', columns='sid', values='return')
+    returns_wide.fillna(0., inplace=True)
+    
+    results = optimizer.optimize(
+        returns=returns_wide,
+        exposures=exposures,
+        sector_dummies=sector_dummies,
+        dates=dates,
+        lookback_periods=1,
+        add_turn_over=add_turn_over
+    )
+
+    df_portfolio = results.get('weights_data')
+
+    config = bt.BacktestConfig(
+        asset_class=bt.AssetClass.EQUITY,
+        portfolio_type=bt.PortfolioType.LONG_SHORT,
+        model_type=factor,
+        annualization_factor=252
+    )
+
+    backtest = bt.Backtest(config=config)
+    df_portfolio.rename(columns={'sid':'ticker', 'weight':'weight'}, inplace=True)
+    df_returns = returns.copy()
+    df_returns.rename(columns={'sid':'ticker'}, inplace=True)
+
+    results_bt = backtest.run_backtest(df_returns, df_portfolio, plot=False)
+    df_ret_opt = backtest.df_pnl.copy()
+
+    return df_portfolio, df_ret_opt, results_bt   
+
 class TrackingErrorConstraints(BaseModel):
     """Tracking error specific portfolio constraints"""
     long_only: bool = True
@@ -631,6 +1029,12 @@ class TrackingErrorOptimizer(BaseModel):
                 weights_df.columns = ['sid', 'weight']
                 weights_df.insert(0, 'date', str(date)) #.replace('-',''))
                 weights_df['date'] = pd.to_datetime(weights_df['date'])
+                
+                # Ensure 'sid' and 'weight' columns exist before merge
+                if 'sid' not in weights_df.columns or 'weight' not in weights_df.columns:
+                    print(f"Warning: weights_df missing required columns. Columns: {weights_df.columns.tolist()}")
+                    continue
+                
                 weights_df = weights_df.merge(
                     current_exposures, 
                     how='left',
@@ -642,15 +1046,32 @@ class TrackingErrorOptimizer(BaseModel):
                 if 'weight' in benchmark_exposures.columns:
                     benchmark_exposures.rename(columns={'weight':'weight_benchmark'}, inplace=True)
 
-                weights_df = weights_df.merge(benchmark_exposures[['date','sid','weight_benchmark']], how='left', on=['date','sid'])
-                # if 'weight_benchmark' not in weights_df.columns:
-                #     weights_df.rename(columns={'wgt':'weight_benchmark'}, inplace=True)
+                # Only merge if benchmark_exposures has the required columns
+                if not benchmark_exposures.empty and all(col in benchmark_exposures.columns for col in ['date', 'sid', 'weight_benchmark']):
+                    weights_df = weights_df.merge(benchmark_exposures[['date','sid','weight_benchmark']], how='left', on=['date','sid'])
+                else:
+                    # If benchmark weights not available, create empty weight_benchmark column
+                    if 'weight_benchmark' not in weights_df.columns:
+                        weights_df['weight_benchmark'] = 0.0
                 
-                weights_data = pd.concat([weights_data, weights_df])
+                # Ensure 'sid' column still exists after merges before concatenating
+                if 'sid' in weights_df.columns and not weights_df.empty:
+                    weights_data = pd.concat([weights_data, weights_df], ignore_index=True)
+                else:
+                    print(f"Warning: weights_df missing 'sid' column or is empty after merges. Skipping date {date}")
+                    continue
 
-        weights_data[['weight','weight_benchmark']] = weights_data.groupby('sid')[['weight','weight_benchmark']].ffill()
-        if weights_data['weight_benchmark'].dtype=='O':
-            weights_data['weight_benchmark'] = weights_data['weight_benchmark'].str.rstrip('%').astype(float)/100.
+        # Only process weights_data if it's not empty and has required columns
+        if not weights_data.empty and 'sid' in weights_data.columns:
+            # Check if required columns exist before groupby
+            required_cols = ['weight', 'weight_benchmark']
+            if all(col in weights_data.columns for col in required_cols):
+                weights_data[required_cols] = weights_data.groupby('sid')[required_cols].ffill()
+                if weights_data['weight_benchmark'].dtype == 'O':
+                    weights_data['weight_benchmark'] = weights_data['weight_benchmark'].str.rstrip('%').astype(float)/100.
+            elif 'weight' in weights_data.columns:
+                # If only 'weight' exists, just forward fill that
+                weights_data['weight'] = weights_data.groupby('sid')['weight'].ffill()
 
         # Identify numeric columns
         numeric_cols = results_data.select_dtypes(include=np.number).columns
