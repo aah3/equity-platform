@@ -38,15 +38,23 @@ app_sqlite_2.py
 # logs
 logs/
 
-# data
-data/market_data.db
-# SPX data files (large files, should not be version controlled)
-data/time_series/**/SPX*.parquet
-data/time_series/benchmarks/SPX_Index_weights.parquet
-data/time_series/exposures/SPX_Index_members.parquet
-data/time_series/prices/SPX*.parquet
-data/time_series/returns/SPX_Index_members.parquet
-data/time_series/factors/SPX*.parquet
+# data - exclude all data files (use S3 or dedicated data server in production)
+data/
+*.parquet
+*.csv
+*.json
+!**/test_data/**/*.parquet
+!**/test_data/**/*.csv
+!**/test_data/**/*.json
+
+# Cache directory
+.cache/
+cache/
+
+# Environment variables
+.env
+.env.local
+.env.production
 
 # src
 app_factors_v1.py
@@ -65,3 +73,4 @@ src/file_data_manager_v1.py
 src/test_postgres.py
 src/index_report_template.py
 financial_dashboard.pdf
+src/test_opt.py
