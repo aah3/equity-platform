@@ -6,9 +6,11 @@ Created on Sat Mar 15 18:36:21 2025
 @author: alfredo
 """
 
-from typing import Dict, List, Optional, Union, Tuple, Literal, Any, Sequence, TypeVar, Generic
+from abc import ABC, abstractmethod
+
+from typing import Dict, List, Optional, Union, Tuple, Literal, Any, Sequence, TypeVar, Generic, Protocol
 from pydantic import BaseModel, Field, field_validator, ValidationError, ConfigDict
-from datetime import date, timedelta #, datetime
+from datetime import date, timedelta, datetime
 from functools import lru_cache
 from scipy import stats
 from enum import Enum
@@ -29,10 +31,19 @@ import seaborn as sns
 import scipy.sparse as sp
 import statsmodels.api as sm
 import logging # Good practice to log errors
+# import bql 
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 from qOptimization import (PurePortfolioConstraints, PureFactorOptimizer)
 # from utils import *
+from file_data_manager import (
+    FileConfig, FileDataManager 
+    )
 import qBacktest as bt
+
 
 # Helper functions: get index constituents
 
@@ -72,15 +83,22 @@ RATING_VALUE_MAP = {
     'CC': 3, 'C': 2, 'D': 1
 }
 
-"""
-# Define framework classes
-"""
+# ================================================================================
+# Enums and Constants
+# ================================================================================
+
 class DataSource(str, Enum):
     """Available data sources"""
     YAHOO = "yahoo"
     BLOOMBERG = "bloomberg"
     REUTERS = "reuters"
     CUSTOM = "custom"
+
+class SectorClassification(str, Enum):
+    """Sector classification standards"""
+    BICS = "BICS"
+    GICS = "GICS"
+    CUSTOM = "CUSTOM"
 
 class Country(str, Enum):
     US = "US"
@@ -113,124 +131,6 @@ class Country(str, Enum):
     Global = "Global"        # regional bucket
     Specific = "Specific"    # sector/special bucket
     Other = "Other"
-
-class Universe_v0(str, Enum):
-    """Global investment universe options"""
-    # North America
-    NDX = "NDX Index"
-    SPX = "SPX Index"
-    RTY = "RTY Index"
-    SPTSX = "SPTSX Index"
-    MID = "MID Index"
-    SML = "SML Index"
-    INDU = "INDU Index"
-    
-    # Europe
-    SXXP = "SXXP Index"
-    UKX = "UKX Index"
-    CAC = "CAC Index"
-    DAX = "DAX Index"
-    IBEX = "IBEX Index"
-    FTSEMIB = "FTSEMIB Index"
-    AEX = "AEX Index"
-    SMI = "SMI Index"
-    NDDUEMU = "NDDUEMU Index"
-    
-    # Asia Pacific
-    NKY = "NKY Index"
-    HSI = "HSI Index"
-    SHSZ300 = "SHSZ300 Index"
-    AS51 = "AS51 Index"
-    KOSPI = "KOSPI Index"
-    NIFTY = "NIFTY Index"
-    STI = "STI Index"
-    
-    # Latin America
-    IBOV = "IBOV Index"
-    MEXBOL = "MEXBOL Index"
-    IPSA = "IPSA Index"
-    MERVAL = "MERVAL Index"
-    
-    # Middle East & Africa
-    TADAWUL = "TADAWUL Index"
-    ADX = "ADX Index"
-    DFM = "DFM Index"
-    QE = "QE Index"
-    TOP40 = "TOP40 Index"
-    
-    # Global
-    MXEA = "MXEA Index"
-    SEMLMCUP = "SEMLMCUP Index"
-
-    @property
-    def description(self) -> str:
-        """Returns the detailed description of the universe"""
-        descriptions: Dict[Universe, str] = {
-            # North America
-            Universe.NDX: "NASDAQ-100 Index - Top 100 non-financial companies listed on NASDAQ",
-            Universe.SPX: "S&P 500 Index - 500 largest US publicly traded companies",
-            Universe.RTY: "Russell 2000 Index - 2000 small-cap US companies",
-            Universe.SPTSX: "S&P/TSX Composite Index - Canadian equity market benchmark",
-            Universe.INDU: "Dow Jones Industrial Average",
-            
-            # Europe
-            Universe.SXXP: "STOXX Europe 600 - Companies across 17 European countries",
-            Universe.UKX: "FTSE 100 Index - 100 largest companies listed on London Stock Exchange",
-            Universe.CAC: "CAC 40 - Benchmark French stock market index of 40 largest equities",
-            Universe.DAX: "DAX 40 - 40 major German blue chip companies trading on Frankfurt Exchange",
-            Universe.IBEX: "IBEX 35 - Benchmark index of Spain's principal stock exchange",
-            Universe.FTSEMIB: "FTSE MIB - 40 most traded stock classes on Italian Exchange",
-            Universe.AEX: "AEX Index - 25 most traded Dutch companies on Amsterdam Exchange",
-            Universe.SMI: "Swiss Market Index - 20 largest Swiss publicly traded companies",
-            Universe.NDDUEMU: "MSCI EMU - Eurozone Economic and Monetary Union",
-            
-            # Asia Pacific
-            Universe.NKY: "Nikkei 225 - Leading Japanese stock market index",
-            Universe.HSI: "Hang Seng Index - Main indicator of Hong Kong market performance",
-            Universe.SHSZ300: "CSI 300 Index - 300 largest A-share stocks in Shanghai and Shenzhen",
-            Universe.AS51: "S&P/ASX 200 - Benchmark for Australian equity market",
-            Universe.KOSPI: "Korea Composite Stock Price Index - Main benchmark of South Korea",
-            Universe.NIFTY: "NIFTY 50 - Benchmark Indian National Stock Exchange index",
-            Universe.STI: "Straits Times Index - Benchmark index for Singapore stock market",
-            
-            # Latin America
-            Universe.IBOV: "Ibovespa - Benchmark index of Brazil's São Paulo Stock Exchange",
-            Universe.MEXBOL: "S&P/BMV IPC - Main benchmark of Mexican Stock Exchange",
-            Universe.IPSA: "S&P/CLX IPSA - Main stock market index of Chile",
-            Universe.MERVAL: "S&P MERVAL - Main index of Buenos Aires Stock Exchange",
-            
-            # Middle East & Africa
-            Universe.TADAWUL: "Tadawul All Share Index - Main index of Saudi Stock Exchange",
-            Universe.ADX: "Abu Dhabi Securities Exchange General Index",
-            Universe.DFM: "Dubai Financial Market General Index",
-            Universe.QE: "Qatar Exchange Index - Main benchmark of Qatar Stock Exchange",
-            Universe.TOP40: "FTSE/JSE Top 40 - Largest 40 companies on Johannesburg Stock Exchange",
-            
-            # Global
-            Universe.MXEA: "The MSCI EAFE region covers DM countries in Europe, Australasia, Israel, and the Far East",
-            Universe.SEMLMCUP: "Solactive GBS Emerging Markets Large & Mid Cap USD Index PR"
-        }
-        return descriptions[self]
-
-    @classmethod
-    def get_all_descriptions(cls) -> Dict[str, str]:
-        """Returns a dictionary of all universes and their descriptions"""
-        return {universe.name: universe.description for universe in cls}
-
-    @classmethod
-    def get_by_region(cls, region: str) -> Dict[str, str]:
-        """Returns indices for a specific region
-        Regions: 'North America', 'Europe', 'Asia Pacific', 'Latin America', 'Middle East & Africa'
-        """
-        region_mapping = {
-            'North America': [cls.NDX, cls.SPX, cls.RTY, cls.SPTSX, cls.INDU],
-            'Europe': [cls.SXXP, cls.UKX, cls.CAC, cls.DAX, cls.IBEX, cls.FTSEMIB, cls.AEX, cls.SMI],
-            'Asia Pacific': [cls.NKY, cls.HSI, cls.SHSZ300, cls.AS51, cls.KOSPI, cls.NIFTY, cls.STI],
-            'Latin America': [cls.IBOV, cls.MEXBOL, cls.IPSA, cls.MERVAL],
-            'Middle East & Africa': [cls.TADAWUL, cls.ADX, cls.DFM, cls.QE, cls.TOP40],
-            'Global': [cls.MXEA, cls.SEMLMCUP]
-        }
-        return {index.name: index.description for index in region_mapping.get(region, [])}
 
 class Universe(str, Enum):
     """Global investment universe options"""
@@ -1039,455 +939,596 @@ def get_universe_mapping_yahoo(universe):
         print("Universe not supported.")
     return universe
 
-def UniverseMappingFactory(source:str='yahoo', universe:str=None) -> str:
+def UniverseMappingFactory(source:str='yahoo', universe:str='') -> str:
     if source=='yahoo':
         return get_universe_mapping_yahoo(universe)
     else:
         return universe
 
-class SecurityMasterBloomberg(BaseModel):
-    """
-    SecurityMaster class for handling benchmark constituents and security master data
-    """
-    source: str = 'bloomberg'
+# ================================================================================
+# Data Models
+# ================================================================================
+
+class SecurityMasterConfig(BaseModel):
+    """Configuration for SecurityMaster initialization"""
+    source: DataSource
     universe: str
-    dates: List[str] = []
-    dates_turnover: List[str] = [] # List of turnover dates in 'YYYY-MM-DD' format
-    bq: object  # Bloomberg Query instance
-    df_bench: pd.DataFrame = pd.DataFrame()
-    df_price: pd.DataFrame = pd.DataFrame()
+    dates: List[str] = Field(default_factory=list)
+    dates_turnover: List[str] = Field(default_factory=list)
+    sector_classification: SectorClassification = SectorClassification.GICS
+    
+    model_config = ConfigDict(frozen=True)
+
+
+class SecurityMetaData(BaseModel):
+    """Security metadata structure"""
+    sid: str
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    industry: Optional[str] = None
+    sub_industry: Optional[str] = None
+    country: Optional[str] = None
+    currency: Optional[str] = None
+    
+    model_config = ConfigDict(frozen=True)
+
+
+class UniverseStats(BaseModel):
+    """Universe statistics structure"""
+    n_dates: int
+    n_securities: int
+    avg_weight_sum: float
+    dates_range: str
+    sectors: Optional[List[str]] = None
+    sectors_count: Optional[int] = None
+    
+    model_config = ConfigDict(frozen=True)
+
+# ================================================================================
+# Abstract Base Class - Security Master Interface
+# ================================================================================
+
+class ISecurityMaster(ABC):
+    """
+    Abstract base class defining the interface for SecurityMaster implementations.
+    
+    This ensures all data source implementations provide the same methods,
+    solving the factory pattern issue where methods weren't accessible.
+    """
+    
+    @abstractmethod
+    def get_benchmark_weights(self) -> pd.DataFrame:
+        """
+        Get benchmark constituent weights over time.
+        
+        Returns:
+            DataFrame with columns: date, sid, name, weight
+        """
+        pass
+    
+    @abstractmethod
+    def get_benchmark_prices(self, start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        """
+        Get benchmark index prices.
+        
+        Args:
+            start_date: Start date in 'YYYY-MM-DD' format
+            end_date: End date in 'YYYY-MM-DD' format
+            
+        Returns:
+            DataFrame with benchmark price data
+        """
+        pass
+    
+    @abstractmethod
+    def get_members_prices(self, tickers: List[str], start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        """
+        Get prices for specific securities.
+        
+        Args:
+            tickers: List of security identifiers
+            start_date: Start date in 'YYYY-MM-DD' format
+            end_date: End date in 'YYYY-MM-DD' format
+            
+        Returns:
+            DataFrame with price data for specified securities
+        """
+        pass
+    
+    @abstractmethod
+    def get_security_master(self) -> pd.DataFrame:
+        """
+        Get complete security master data including classifications.
+        
+        Returns:
+            DataFrame with security master data
+        """
+        pass
+    
+    @abstractmethod
+    def get_meta_data(self) -> pd.DataFrame:
+        """
+        Get metadata for securities including sector classifications.
+        
+        Returns:
+            DataFrame with security metadata
+        """
+        pass
+    
+    @abstractmethod
+    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
+        """
+        Get dummy variables for categorical data.
+        
+        Args:
+            dummy_name: Column name to create dummies from
+            
+        Returns:
+            DataFrame with dummy variables
+        """
+        pass
+    
+    @abstractmethod
+    def get_universe_stats(self) -> UniverseStats:
+        """
+        Get statistics about the universe.
+        
+        Returns:
+            UniverseStats object with universe statistics
+        """
+        pass
+    
+    @abstractmethod
+    def get_sector_weights(self) -> pd.DataFrame:
+        """
+        Get sector weights over time.
+        
+        Returns:
+            DataFrame with sector weights by date
+        """
+        pass
+    
+    @abstractmethod
+    def get_returns_long(self) -> pd.DataFrame:
+        """
+        Get returns in long format.
+        
+        Returns:
+            DataFrame with columns: date, sid, return, price
+        """
+        pass
+    
+    @abstractmethod
+    def get_returns_wide(self) -> pd.DataFrame:
+        """
+        Get returns in wide format (pivot table).
+        
+        Returns:
+            DataFrame with dates as index and securities as columns
+        """
+        pass
+    
+    @abstractmethod
+    def get_volume_long(self, n_window: int = 22) -> pd.DataFrame:
+        """
+        Get volume data with moving averages.
+        
+        Args:
+            n_window: Window size for moving average
+            
+        Returns:
+            DataFrame with volume data and averages
+        """
+        pass
+
+    @abstractmethod
+    def get_portfolio(self, start_date: str|None=None, end_date: str|None=None, path: str|None=None) -> pd.DataFrame:
+        """
+        Get portfolio.
+        
+        Args:
+            start_date: Start date in 'YYYY-MM-DD' format
+            end_date: End date in 'YYYY-MM-DD' format
+            path: file path for portfolio
+            
+        Returns:
+            DataFrame with portfolio data, including dates, security id's and weights
+        """
+        pass
+    
+
+# ================================================================================
+# Base Implementation with Common Functionality
+# ================================================================================
+
+class BaseSecurityMaster(BaseModel, ISecurityMaster):
+    """
+    Base implementation with common functionality shared across data sources.
+    
+    This class implements common methods and utilities that can be reused
+    by specific data source implementations.
+    """
+    
+    config: SecurityMasterConfig
+    df_bench: pd.DataFrame = Field(default_factory=pd.DataFrame)
+    df_price: pd.DataFrame = Field(default_factory=pd.DataFrame)
+    df_portfolio: Optional[pd.DataFrame] = None
     weights_data: Optional[pd.DataFrame] = None
     security_master: Optional[pd.DataFrame] = None
     meta_data: Optional[pd.DataFrame] = None
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
-    def fill_equal_values(df: pd.DataFrame, group_by_col: str = 'date', check_col: str = 'weight') -> pd.DataFrame:
+    @staticmethod
+    def fill_equal_weights(df: pd.DataFrame, 
+                          group_by_col: str = 'date', 
+                          check_col: str = 'weight') -> pd.DataFrame:
         """
-        Ensure every date-group in df has a non-null weight column:
-          - If the weight column doesn't exist, create it.
-          - For each date, if any row has weight == NaN, then override that entire date-group
-            with equal weights summing to 1.
-
-        Returns a new DataFrame (does not operate in-place).
+        Fill missing weights with equal weights for each group.
         
-        Usage: df = fill_equal_values(df, group_by_col='date', check_col='weight')
+        Args:
+            df: DataFrame with weight data
+            group_by_col: Column to group by
+            check_col: Column to check for missing values
+            
+        Returns:
+            DataFrame with filled weights
         """
         df = df.copy()
-
-        # 1) make sure the weight column exists
+        
         if check_col not in df.columns:
             df[check_col] = np.nan
-
-        # 2) for each date, check for any NaNs and, if so, assign 1/n to every row in that group
-        def _fill_grp(g):
-            if g[check_col].isna().any():
-                g[check_col] = 1.0 / len(g)
-            return g
-
-        return (
-            df
-            .groupby(group_by_col, group_keys=False)  # don't add the group key to the index
-            .apply(_fill_grp)
+        
+        def fill_group(group):
+            if group[check_col].isna().any():
+                group[check_col] = 1.0 / len(group)
+            return group
+        
+        return df.groupby(group_by_col, group_keys=False).apply(fill_group)
+    
+    def get_sector_weights(self) -> pd.DataFrame:
+        """Common implementation for sector weights calculation"""
+        if self.security_master is None:
+            self.security_master = self.get_security_master()
+        
+        sector_weights = (
+            self.security_master
+            .groupby(['date', 'sector'])['weight']
+            .sum()
+            .unstack()
+            .fillna(0)
         )
-
-    def get_meta_data(self, sector_classification: str = 'BICS') -> None:
-        """
-        Get meta data for security master tickers data including sector, industry, sub-industry classifications, etc.
-        Data not time series dependent, but static.
         
-        Args:
-            sector_classification: 'BICS' or 'GICS'
-            
-        Returns:
-            DataFrame with security master data
-        """
-        univ_list = list(self.weights_data.sid.unique())
-                    
-        # Get sector classification
-        if sector_classification.upper() == 'BICS':
-            sector = self.bq.data.bics_level_1_sector_name()
-            # industry_group = self.bq.data.BICS_LEVEL_2_INDUSTRY_GROUP_NAME()
-            industry = self.bq.data.BICS_LEVEL_3_INDUSTRY_NAME()
-            sub_industry = self.bq.data.BICS_LEVEL_4_SUB_INDUSTRY_NAME()
-            request = {'sector': sector, 'industry': industry, 'sub_industry': sub_industry}
-        elif sector_classification.upper() == 'GICS':
-            gics = self.bq.data.gics_sub_industry()
-            sector = self.bq.data.gics_sector_name()
-            industry_group = self.bq.data.GICS_INDUSTRY_GROUP_NAME()
-            industry = self.bq.data.GICS_INDUSTRY_NAME()
-            sub_industry = self.bq.data.GICS_SUB_INDUSTRY_NAME()
-            request = {'gics': gics, 'sector': sector, 'industry_group': industry_group, 'industry': industry, 'sub_industry': sub_industry}
-        else:
-            raise ValueError("sector_classification must be either 'BICS' or 'GICS'")
-
-        req = bql.Request(univ_list, request)
-        res = self.bq.execute(req)
-        meta_data = pd.DataFrame({r.name: r.df()[r.name] for r in res})
-        meta_data = meta_data.reset_index(drop=False).rename(columns={'ID': 'sid'})
-        meta_data.index = meta_data.sid
-        meta_data.index.name = None
-
-        self.meta_data = meta_data
-        return None
-
-    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
-        """
-        Get dummy dataframe from meta data
+        return pd.DataFrame(sector_weights)
+    
+    def get_returns_long(self) -> pd.DataFrame:
+        """Common implementation for returns in long format"""
+        if self.df_price.empty:
+            raise ValueError("Price data not loaded. Call get_members_prices() first.")
         
-        Args:
-            dummy_name: 'sector', 'industry_group', 'industry', 'sub_industry'
-            
-        Returns:
-            DataFrame with dummy_name as columns and values of 0 or 1
-            DataFrame index is the security id.
-        """
-        if self.meta_data is None:
-            self.get_meta_data()
-
-        from utils import clean_list_items
-        df_dummies = pd.get_dummies(self.meta_data[dummy_name])
-        input_list = list(df_dummies.columns)
-
-        df_dummies.columns = clean_list_items(input_list)
-        return df_dummies
-
-    def get_benchmark_weights(self) -> pd.DataFrame:
-        """
-        Get benchmark constituent weights over time
+        df_ret_long = self.df_price[['date', 'sid', 'return', 'price']].copy()
+        df_ret_long = pd.DataFrame(df_ret_long)
+        df_ret_long['price'] = df_ret_long.groupby('sid')['price'].ffill()
+        df_ret_long['return'] = df_ret_long['return'].fillna(0.0)
         
-        Returns:
-            DataFrame with benchmark weights
-        """
+        return df_ret_long
+    
+    def get_returns_wide(self) -> pd.DataFrame:
+        """Common implementation for returns in wide format"""
+        if self.df_price.empty:
+            raise ValueError("Price data not loaded. Call get_members_prices() first.")
+        
+        df_ret_wide = (
+            self.df_price[['date', 'sid', 'return']]
+            .pivot(index='date', columns='sid', values='return')
+            .fillna(0.0)
+        )
+        
+        return df_ret_wide
+    
+    def get_volume_long(self, n_window: int = 22) -> pd.DataFrame:
+        """Common implementation for volume data with moving averages"""
+        if self.df_price.empty:
+            raise ValueError("Price data not loaded. Call get_members_prices() first.")
+        
+        df_volume = self.df_price[['date', 'sid', 'price', 'volume']].copy()
+        df_volume = pd.DataFrame(df_volume)
+        df_volume['volume_mm'] = df_volume['price'] * df_volume['volume'] / 1e6
+        df_volume.sort_values(by=['sid', 'date'], ascending=True, inplace=True)
+        
+        # Calculate moving averages
+        df_volume['volume_avg'] = (
+            df_volume.groupby('sid')['volume']
+            .rolling(window=n_window)
+            .mean()
+            .reset_index(drop=True)
+        )
+        df_volume['volume_mm_avg'] = (
+            df_volume.groupby('sid')['volume_mm']
+            .rolling(window=n_window)
+            .mean()
+            .reset_index(drop=True)
+        )
+        
+        df_volume.fillna(0.0, inplace=True)
+        
+        return df_volume
+    
+    def get_universe_stats(self) -> UniverseStats:
+        """Common implementation for universe statistics"""
+        if self.weights_data is None:
+            self.weights_data = self.get_benchmark_weights()
+        
+        stats = UniverseStats(
+            n_dates=len(self.config.dates),
+            n_securities=len(self.weights_data['sid'].unique()),
+            avg_weight_sum=self.weights_data.groupby('date')['weight'].sum().mean(),
+            dates_range=f"{min(self.config.dates)} to {max(self.config.dates)}"
+        )
+        
+        if self.security_master is not None:
+            stats.sectors = self.security_master['sector'].unique().tolist()
+            stats.sectors_count = len(stats.sectors)
+        
+        return stats
+
+
+# ================================================================================
+# Bloomberg Implementation
+# ================================================================================
+
+class SecurityMasterBloomberg(BaseSecurityMaster):
+    """
+    Bloomberg-specific implementation of SecurityMaster.
+    
+    Requires Bloomberg terminal access and BQL library.
+    """
+    
+    bq: Optional[Any] = None  # Bloomberg Query instance
+    
+    def __init__(self, **data):
+        """Initialize Bloomberg SecurityMaster with BQL connection"""
+        super().__init__(**data)
+        self._initialize_bloomberg()
+    
+    def _initialize_bloomberg(self):
+        """Initialize Bloomberg Query Language connection"""
         try:
-            # Define data items for BQL query
             import bql
+            self.bq = bql.Service(preferences={'currencyCheck': 'when_available'})
+            logger.info("Bloomberg BQL connection established")
+        except ImportError:
+            logger.error("BQL library not available. Bloomberg terminal required.")
+            raise ImportError("Bloomberg terminal and BQL library required")
+    
+    def get_benchmark_weights(self) -> pd.DataFrame:
+        """Get benchmark weights from Bloomberg"""
+        try:
+            import bql
+            
             data_items = {
                 'Name': self.bq.data.name()['VALUE'],
                 'Weights': self.bq.data.id()['WEIGHTS']
             }
             
             df_weights = pd.DataFrame()
-            for idate in self.dates_turnover:
-                # Get universe members for each date
-                universe = self.bq.univ.members(self.universe, dates=idate)
+            
+            for idate in self.config.dates_turnover:
+                universe = self.bq.univ.members(self.config.universe, dates=idate)
                 request = bql.Request(universe, data_items)
                 response = self.bq.execute(request)
                 
-                # Process response
-                df = pd.concat([data_item.df() for data_item in response], axis=1)
+                df = pd.concat([item.df() for item in response], axis=1)
                 df.reset_index(drop=False, inplace=True)
                 df.insert(0, 'date', idate)
                 df.columns = ['date', 'sid', 'name', 'weight']
                 df_weights = pd.concat([df_weights, df])
             
-            # Format dates and weights
-            # df_weights = df_weights.set_index('date')
-            df_weights.index = df_weights['date']
-            df_weights.index.name = 'index'
-            # df_weights['date'] = df_weights['date'].astype(str)    
-            # df_weights['date'] = df_weights['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)    
-            df_weights['weight'] /= 100
-            # df_weights.reset_index(drop=True, inplace=True)
+            df_weights['weight'] /= 100  # Convert to decimal
+            df_weights.set_index('date', inplace=True)
             
             self.weights_data = df_weights
             return self.weights_data
             
         except Exception as e:
-            raise Exception(f"Error getting benchmark weights: {str(e)}")
+            logger.error(f"Error getting Bloomberg benchmark weights: {str(e)}")
+            raise
     
-    def get_security_master(self, sector_classification: str = 'BICS') -> pd.DataFrame:
-        """
-        Get security master data including sector classifications
-        
-        Args:
-            sector_classification: 'BICS' or 'GICS'
-            
-        Returns:
-            DataFrame with security master data
-        """
+    def get_benchmark_prices(self, start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        """Get benchmark prices from Bloomberg"""
         try:
             import bql
-            if self.weights_data is None:
-                self.weights_data = self.get_benchmark_weights()
-                
-            univ_list = list(self.weights_data.sid.unique())
             
-            # Get sector classification
-            if sector_classification.upper() == 'BICS':
-                sector = self.bq.data.bics_level_1_sector_name()
-            elif sector_classification.upper() == 'GICS':
-                sector = self.bq.data.gics_sector_name()
-            else:
-                raise ValueError("sector_classification must be either 'BICS' or 'GICS'")
+            px_last = self.bq.data.px_last(
+                dates=self.bq.func.range(start_date, end_date),
+                frq='d',
+                ca_adj='full'
+            ).dropna()
             
-            # Get sector data
-            request = {'sector': sector}
-            req = bql.Request(univ_list, request)
-            res = self.bq.execute(req)
-            sec_map = pd.DataFrame({r.name: r.df()[r.name] for r in res})
+            request = bql.Request([self.config.universe], {'price': px_last})
+            response = self.bq.execute(request)
             
-            # Create dummy variables for sectors
-            df_sec = pd.get_dummies(sec_map)
+            df_bench = response[0].df()
+            df_bench.reset_index(inplace=True)
+            df_bench.columns = ['date', 'price']
+            df_bench.set_index('date', inplace=True)
             
-            # Create security master
-            sec_master = self.weights_data.copy()
-            sec_master.insert(2, 'id', sec_master['sid'])
-            sec_master['sid'] = sec_master['sid']
-            sec_master.insert(1, 'yy', sec_master['date'].map(lambda x: x[:4]))
-            
-            # Merge with sector data
-            sec_master = sec_master.merge(
-                sec_map.reset_index(drop=False).rename(columns={'ID': 'id'}),
-                how='left',
-                on=['id']
-            )
-            
-            # Format dates and sort
-            sec_master.sort_values(['date', 'sid'], inplace=True)
-            sec_master = sec_master.set_index('date')
-            # sec_master.index = sec_master['date']
-            # sec_master.index.name = 'index' 
-            # sec_master['date'] = sec_master['date'].astype(str)
-            # sec_master['date'] = sec_master['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
-            # sec_master.reset_index(drop=True, inplace=True)
-            
-            self.security_master = sec_master
-            return self.security_master
-            
-        except Exception as e:
-            raise Exception(f"Error getting security master: {str(e)}")
-    
-    def get_universe_stats(self) -> Dict:
-        """
-        Get basic statistics about the universe
-        
-        Returns:
-            Dictionary with universe statistics
-        """
-        if self.weights_data is None:
-            self.weights_data = self.get_benchmark_weights()
-        df_stats = {
-            'n_dates': len(self.dates),
-            'n_securities': len(self.weights_data.sid.unique()),
-            'avg_weight_sum': self.weights_data.groupby('date')['weight'].sum().mean(),
-            'dates_range': f"{min(self.dates)} to {max(self.dates)}"
-        }
-        
-        if self.security_master is not None:
-            df_stats['sectors'] = self.security_master.sector.unique().tolist()
-            df_stats['sectors_count'] = len(df_stats['sectors'])
-            
-        return df_stats
-    
-    def get_sector_weights(self) -> pd.DataFrame:
-        """
-        Get sector weights over time
-        
-        Returns:
-            DataFrame with sector weights
-        """
-        if self.security_master is None:
-            self.security_master = self.get_security_master()
-            
-        sector_weights = (self.security_master
-                         .groupby(['date', 'sector'])['weight']
-                         .sum()
-                         .unstack()
-                         .fillna(0))
-        
-        return sector_weights
-
-    def get_benchmark_prices(self, model_input) -> pd.DataFrame:
-        if model_input.backtest.universe is not None:
-            if self.df_bench.shape[0]==0:
-                df_bench = self._get_prices(model_input, univ_list = [model_input.backtest.universe.value])
-                self.df_bench = df_bench
+            self.df_bench = df_bench
             return self.df_bench
             
-    def get_members_prices(self, model_input) -> pd.DataFrame:
-        if model_input.backtest.universe_list is not None:
-            if self.df_price.shape[0]==0:
-                df_price = self._get_prices(model_input, univ_list = model_input.backtest.universe_list)
-                self.df_price = df_price
-            return self.df_price
-        
-    def _get_prices(self, model_input, univ_list:list=[]) -> pd.DataFrame:
-        start = str(model_input.backtest.start_date)
-        end = str(model_input.backtest.end_date)
-        if univ_list==[]:
-            univ_list = model_input.backtest.universe_list
-        if type(univ_list) != list:
-            univ_list = list(univ_list)
-        # get pricing data
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        px_last = bq.data.px_last(dates= bq.func.range(start, end), frq='d', ca_adj='full').dropna() # fill='prev',
-        px_open = bq.data.px_open(dates= bq.func.range(start, end), frq='d', ca_adj='full').dropna()
-        px_high = bq.data.px_high(dates= bq.func.range(start, end), frq='d', ca_adj='full').dropna()
-        px_low = bq.data.px_low(dates= bq.func.range(start, end), frq='d', ca_adj='full').dropna()
-        volume = bq.data.px_volume(dates= bq.func.range(start, end), frq='d', ca_adj='full').dropna()
-        ret = bq.data.day_to_day_tot_return_gross_dvds(start, end).dropna()
-        size = bq.data.market_cap(dates= bq.func.range(start, end)).log()
-        request = {'price':px_last, 'ret':ret, 'size':size, 'p_high':px_high, 'p_low':px_low}
-        req = bql.Request(univ_list, request)
-        res = bq.execute(req)
-
-        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1)
-        df_price = df_price.dropna(subset=['price'])
-        # import pdb; pdb.set_trace()
-        df_price.reset_index(drop=False, inplace=True)
-        df_price.rename(columns={'DATE':'date','ID':'sid','ret':'return'}, inplace=True)
-        # df_price.index = df_price['date']
-        # df_price.index.name = 'index' 
-        df_price = df_price.set_index('date')
-        return df_price
+        except Exception as e:
+            logger.error(f"Error getting Bloomberg benchmark prices: {str(e)}")
+            raise
     
-    def get_returns_long(self) -> pd.DataFrame:
-        # get returns long format 
-        df_ret_long = self.df_price[['date','sid','return','price']].copy() # print(df_ret_long.tail(3))
-        df_ret_long['price'] = df_ret_long.groupby('sid').ffill()['price']
-        df_ret_long['return'] = df_ret_long['return'].fillna(0.0)
-        return df_ret_long
-
-    def get_returns_wide(self) -> pd.DataFrame:
-        # get returns wide format
-        df_ret_wide = self.df_price[['date','sid','return']].pivot(index='date', columns='sid', values='return')
-        df_ret_wide.fillna(0., inplace=True)
-        return df_ret_wide
-
-    def get_volume_long(self, n_window=22) -> pd.DataFrame:
-        if self.df_price.shape[0] > 0:
-            df_volume = self.df_price[['date','sid','price','volume']].reset_index(drop=True).copy()
-            df_volume['volume_mm'] = df_volume['price'] * df_volume['volume']/1e6
-            df_volume.sort_values(by=['sid','date'], ascending=(True, True), inplace=True)
-
-            df_volume['volume_avg'] = df_volume.groupby('sid')['volume'].rolling(window=n_window).mean().reset_index(drop=True)
-            df_volume['volume_mm_avg'] = df_volume.groupby('sid')['volume_mm'].rolling(window=n_window).mean().reset_index(drop=True)
-            df_volume.fillna(0., inplace=True)
-            df_volume.reset_index(drop=True, inplace=True)
-            # display(df_volume.groupby(['sid']).tail(1).sort_values(['volume_mm_avg'], ascending=False).head())
-            return df_volume
-        
-        return pd.DataFrame()
-
-class SecurityMasterYahoo(BaseModel):
-    """
-    SecurityMaster class using Yahoo Finance API for handling benchmark constituents and security master data.
-    """
-    source: str = 'yahoo'
-    universe: str  # Universe (e.g., '^GSPC' for S&P 500, '^NDX' for Nasdaq 100)
-    dates: List[str] = []  # List of dates in 'YYYY-MM-DD' format
-    dates_turnover: List[str] = [] # List of turnover dates in 'YYYY-MM-DD' format
-    df_bench: pd.DataFrame = pd.DataFrame()
-    df_price: pd.DataFrame = pd.DataFrame()
-    weights_data: Optional[pd.DataFrame] = None
-    security_master: Optional[pd.DataFrame] = None
-    df_portfolio: pd.DataFrame = pd.DataFrame()
-    concurrent_download: Optional[bool] = None
-    model_input: Optional[Any] = None
-    meta_data: Optional[pd.DataFrame] = None
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    # def get_universe_mapping(self):
-    #     if self.universe=='NDX Index':
-    #         self.universe='^NDX'
-    #     else:
-    #         self.universe='^SPX'
-
-    def fill_equal_values(df: pd.DataFrame, group_by_col: str = 'date', check_col: str = 'weight') -> pd.DataFrame:
-        """
-        Ensure every date-group in df has a non-null weight column:
-          - If the weight column doesn't exist, create it.
-          - For each date, if any row has weight == NaN, then override that entire date-group
-            with equal weights summing to 1.
-
-        Returns a new DataFrame (does not operate in-place).
-        
-        Usage: df = fill_equal_values(df, group_by_col='date', check_col='weight')
-        """
-        df = df.copy()
-
-        # 1) make sure the weight column exists
-        if check_col not in df.columns:
-            df[check_col] = np.nan
-
-        # 2) for each date, check for any NaNs and, if so, assign 1/n to every row in that group
-        def _fill_grp(g):
-            if g[check_col].isna().any():
-                g[check_col] = 1.0 / len(g)
-            return g
-
-        return (
-            df
-            .groupby(group_by_col, group_keys=False)  # don't add the group key to the index
-            .apply(_fill_grp)
-        )
-
-    def get_meta_data(self, sector_classification: str = 'Custom') -> None:
-        """
-        Get meta data for security master tickers data including sector, industry, sub-industry classifications, etc.
-        Data not time series dependent, but static.
-        
-        Args:
-            sector_classification: 'BICS' or 'GICS'
+    def get_members_prices(self, tickers: List[str]=[], start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        """Get member prices from Bloomberg"""
+        try:
+            import bql
             
-        Returns:
-            DataFrame with security master data
-        """
-        univ_list = list(self.weights_data.sid.unique())
-                    
-        # Get sector classification
-        if sector_classification.upper() == 'BICS':
-            sector = self.bq.data.bics_level_1_sector_name()
-            # industry_group = self.bq.data.BICS_LEVEL_2_INDUSTRY_GROUP_NAME()
-            industry = self.bq.data.BICS_LEVEL_3_INDUSTRY_NAME()
-            sub_industry = self.bq.data.BICS_LEVEL_4_SUB_INDUSTRY_NAME()
-            request = {'sector': sector, 'industry': industry, 'sub_industry': sub_industry}
-        elif sector_classification.upper() == 'GICS':
-            gics = self.bq.data.gics_sub_industry()
-            sector = self.bq.data.gics_sector_name()
-            industry_group = self.bq.data.GICS_INDUSTRY_GROUP_NAME()
-            industry = self.bq.data.GICS_INDUSTRY_NAME()
-            sub_industry = self.bq.data.GICS_SUB_INDUSTRY_NAME()
-            request = {'gics': gics, 'sector': sector, 'industry_group': industry_group, 'industry': industry, 'sub_industry': sub_industry}
-        elif sector_classification.upper() == 'CUSTOM':
-            self.meta_data = self.security_master
-            return None
-        else:
-            raise ValueError("sector_classification must be either 'BICS' or 'GICS'")
-
-        req = bql.Request(univ_list, request)
-        res = self.bq.execute(req)
-        meta_data = pd.DataFrame({r.name: r.df()[r.name] for r in res})
-        meta_data = meta_data.reset_index(drop=False).rename(columns={'ID': 'sid'})
-        meta_data.index = meta_data.sid
-        meta_data.index.name = None
-
-        self.meta_data = meta_data
-        return None
-
-    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
-        """
-        Get dummy dataframe from meta data
-        
-        Args:
-            dummy_name: 'sector', 'industry_group', 'industry', 'sub_industry'
+            # Define data items
+            px_last = self.bq.data.px_last(
+                dates=self.bq.func.range(start_date, end_date),
+                frq='d',
+                ca_adj='full'
+            ).dropna()
+            px_open = self.bq.data.px_open(
+                dates=self.bq.func.range(start_date, end_date),
+                frq='d',
+                ca_adj='full'
+            ).dropna()
+            px_high = self.bq.data.px_high(
+                dates=self.bq.func.range(start_date, end_date),
+                frq='d',
+                ca_adj='full'
+            ).dropna()
+            px_low = self.bq.data.px_low(
+                dates=self.bq.func.range(start_date, end_date),
+                frq='d',
+                ca_adj='full'
+            ).dropna()
+            volume = self.bq.data.px_volume(
+                dates=self.bq.func.range(start_date, end_date),
+                frq='d'
+            ).dropna()
+            ret = self.bq.data.day_to_day_tot_return_gross_dvds(start_date, end_date).dropna()
             
-        Returns:
-            DataFrame with dummy_name as columns and values of 0 or 1
-            DataFrame index is the security id.
-        """
+            request = {
+                'price': px_last,
+                'open': px_open,
+                'high': px_high,
+                'low': px_low,
+                'volume': volume,
+                'return': ret
+            }
+            
+            req = bql.Request(tickers, request)
+            res = self.bq.execute(req)
+            
+            # Combine results
+            df_list = []
+            for item in res:
+                df = item.df()
+                df['metric'] = item.name
+                df_list.append(df)
+            
+            df_price = pd.concat(df_list, axis=1)
+            df_price.reset_index(inplace=True)
+            df_price.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+            df_price.set_index('date', inplace=True)
+            
+            self.df_price = df_price
+            return self.df_price
+            
+        except Exception as e:
+            logger.error(f"Error getting Bloomberg member prices: {str(e)}")
+            raise
+    
+    def get_security_master(self) -> pd.DataFrame:
+        """Get security master data from Bloomberg"""
+        if self.weights_data is None:
+            self.weights_data = self.get_benchmark_weights()
+        
         if self.meta_data is None:
-            self.get_meta_data()
-
-        from utils import clean_list_items
+            self.meta_data = self.get_meta_data()
+        
+        # Merge weights with metadata
+        sec_master = self.weights_data.copy()
+        sec_master = sec_master.merge(
+            self.meta_data,
+            left_on='sid',
+            right_index=True,
+            how='left'
+        )
+        
+        self.security_master = sec_master
+        return self.security_master
+    
+    def get_meta_data(self) -> pd.DataFrame:
+        """Get metadata from Bloomberg"""
+        try:
+            import bql
+            
+            if self.weights_data is None:
+                self.weights_data = self.get_benchmark_weights()
+            
+            univ_list = list(self.weights_data['sid'].unique())
+            
+            # Get classification data based on config
+            if self.config.sector_classification == SectorClassification.BICS:
+                request = {
+                    'sector': self.bq.data.bics_level_1_sector_name(),
+                    'industry': self.bq.data.bics_level_3_industry_name(),
+                    'sub_industry': self.bq.data.bics_level_4_sub_industry_name()
+                }
+            else:  # GICS
+                request = {
+                    'sector': self.bq.data.gics_sector_name(),
+                    'industry': self.bq.data.gics_industry_name(),
+                    'sub_industry': self.bq.data.gics_sub_industry_name()
+                }
+            
+            req = bql.Request(univ_list, request)
+            res = self.bq.execute(req)
+            
+            meta_data = pd.DataFrame({r.name: r.df()[r.name] for r in res})
+            meta_data.reset_index(drop=False, inplace=True)
+            meta_data.rename(columns={'ID': 'sid'}, inplace=True)
+            meta_data.set_index('sid', inplace=True)
+            
+            self.meta_data = meta_data
+            return self.meta_data
+            
+        except Exception as e:
+            logger.error(f"Error getting Bloomberg metadata: {str(e)}")
+            raise
+    
+    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
+        """Get sector dummy variables"""
+        if self.meta_data is None:
+            self.meta_data = self.get_meta_data()
+        
+        if dummy_name not in self.meta_data.columns:
+            raise ValueError(f"Column '{dummy_name}' not found in metadata")
+        
         df_dummies = pd.get_dummies(self.meta_data[dummy_name])
-        input_list = list(df_dummies.columns)
-
-        df_dummies.columns = clean_list_items(input_list)
+        
+        # Clean column names (remove special characters)
+        df_dummies.columns = [
+            col.replace(' ', '_').replace('&', 'and').replace('-', '_')
+            for col in df_dummies.columns
+        ]
+        
         return df_dummies
+
+
+# ================================================================================
+# Yahoo Finance Implementation
+# ================================================================================
+
+class SecurityMasterYahoo(BaseSecurityMaster):
+    """
+    Yahoo Finance implementation of SecurityMaster.
+    
+    Uses yfinance library for free market data access.
+    """
+    
+    concurrent_download: Optional[bool] = True
+    _yf_cache: Dict[str, Any] = {}
+    
+    def __init__(self, **data):
+        """Initialize Yahoo SecurityMaster"""
+        super().__init__(**data)
+        self._yf_cache = {}
+    
+    @lru_cache(maxsize=128)
+    def _get_ticker_info(self, ticker: str) -> Dict:
+        """Cached ticker info retrieval"""
+        import yfinance as yf
+        try:
+            return yf.Ticker(ticker).info
+        except Exception as e:
+            logger.warning(f"Failed to get info for {ticker}: {e}")
+            return {}
 
     def _get_ticker_components(self, ticker: str, date: str) -> pd.DataFrame: # Optional[List[str] | None]
         """
@@ -1695,7 +1736,7 @@ class SecurityMasterYahoo(BaseModel):
 
         def get_components_for_date(idate):
             time.sleep(1)
-            components = self._get_ticker_components(self.universe, idate)
+            components = self._get_ticker_components(self.config.universe, idate)
             if components.shape[0] > 0:
                 df = components.copy()
                 if 'weight' in components.columns:
@@ -1727,7 +1768,7 @@ class SecurityMasterYahoo(BaseModel):
             async def gather_all():
                 loop = asyncio.get_event_loop()
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    tasks = [loop.run_in_executor(executor, get_components_for_date, idate) for idate in self.dates_turnover]
+                    tasks = [loop.run_in_executor(executor, get_components_for_date, idate) for idate in self.config.dates_turnover]
                     results = await asyncio.gather(*tasks)
                 return [df for df in results if df is not None]
 
@@ -1742,7 +1783,7 @@ class SecurityMasterYahoo(BaseModel):
             if results:
                 df_weights = pd.concat(results)
         else:
-            for idate in self.dates_turnover:
+            for idate in self.config.dates_turnover:
                 df = get_components_for_date(idate)
                 if df is not None:
                     df_weights = pd.concat([df_weights, df])
@@ -1768,7 +1809,7 @@ class SecurityMasterYahoo(BaseModel):
                 df_weights = df_weights.groupby('date', group_keys=False).apply(assign_equal_weights)
             # Ensure weight is float type
             df_weights['weight'] = df_weights['weight'].astype(float)
-            df_weights['universe_id'] = UniverseMappingFactory(source='yahoo', universe=self.universe)
+            df_weights['universe_id'] = UniverseMappingFactory(source='yahoo', universe=self.config.universe)
             self.weights_data = df_weights
         else:
             self.weights_data = pd.DataFrame()
@@ -1816,26 +1857,6 @@ class SecurityMasterYahoo(BaseModel):
         self.security_master = sec_master
         return self.security_master
 
-    def get_universe_stats(self) -> Dict:
-        """
-        Get basic statistics about the universe.
-        """
-        if self.weights_data is None:
-            self.weights_data = self.get_benchmark_weights()
-
-        df_stats = {
-            'n_dates': len(self.dates),
-            'n_securities': len(self.weights_data.sid.unique()) if not self.weights_data.empty else 0,
-            'avg_weight_sum': self.weights_data.groupby('date')['weight'].sum().mean() if not self.weights_data.empty else 0,
-            'dates_range': f"{min(self.dates)} to {max(self.dates)}"
-        }
-
-        if self.security_master is not None:
-            df_stats['sectors'] = self.security_master.sector.unique().tolist()
-            df_stats['sectors_count'] = len(df_stats['sectors'])
-
-        return df_stats
-
     def get_sector_weights(self) -> pd.DataFrame:
         """
         Get sector weights over time.
@@ -1854,119 +1875,38 @@ class SecurityMasterYahoo(BaseModel):
 
         return sector_weights
 
-    def get_benchmark_prices(self) -> pd.DataFrame:
-        if self.universe is not None:
+    def get_benchmark_prices(self, start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        if self.config.universe is not None:
             if self.df_bench.shape[0] == 0:
-                df_bench = self._get_prices(univ_list=[self.universe])
+                df_bench = self._get_prices(univ_list=[self.config.universe])
                 self.df_bench = df_bench
             return self.df_bench
         return pd.DataFrame()
 
-    def get_members_prices(self, model_input) -> pd.DataFrame:
-        if model_input.backtest.universe_list is not None:
+    def get_members_prices(self, tickers: List[str]=[], start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        if tickers is not []:
             if self.df_price.shape[0] == 0:
-                df_price = self._get_prices(univ_list=model_input.backtest.universe_list)
+                df_price = self._get_prices(univ_list=tickers)
                 self.df_price = df_price
             return self.df_price
         return pd.DataFrame()
     
-    def get_portfolio(self, model_input, path: str | None = None) -> pd.DataFrame:
-        if model_input.backtest.portfolio_list is not None:
-            try:
-                if path is None:
-                    path = path="./data/time_series/portfolios/portfolio.csv" #".\data\time_series\portfolios\portfolio.csv"
-                df = pd.read_csv(path)
-                self.df_portfolio = df
-            except:
-                print("Portfolio file missing.")
-        return self.df_portfolio
-    
-    def _get_prices_v0(self, univ_list: List[str]) -> pd.DataFrame: # model_input, 
-        """Helper function to get prices from Yahoo Finance."""
-        import asyncio
-        import concurrent.futures
-        import sys
-        import pandas as pd
-        import numpy as np
-        import yfinance as yf
-        import time
-
-        # Determine if async download is requested (backwards compatible)
-        concurrent_download = getattr(self, 'concurrent_download', None)
-        if concurrent_download is None:
-            # Try to get from model_input if available
-            concurrent_download = False
-            if hasattr(self, 'model_input') and hasattr(self.model_input, 'backtest'):
-                concurrent_download = getattr(self.model_input.backtest, 'concurrent_download', False)
-        # If not found, fallback to False
-        if concurrent_download is None:
-            concurrent_download = False
-        if len(univ_list) > 1:
-            # TO DO: Fix why it's not working for multiple tickers... it works for only one at a time
-            concurrent_download = False
-
-        price_data = []
-        start_date = min(self.dates)
-        end_date = max(self.dates)
-
-        def download_one(ticker):
-            time.sleep(1)
-            try:
-                df = yf.download(
-                    ticker, 
-                    start=start_date, 
-                    end=pd.to_datetime(end_date) + pd.Timedelta(days=1)
-                    )
-                if df is not None and not df.empty:
-                    # Handle both MultiIndex and flat columns
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df = df.xs(ticker, axis=1, level='Ticker')
-                    df.index.name = None
-                    df.insert(0, 'date', df.index)
-                    df.insert(1, 'sid', ticker)
-                    df.columns = [i.lower() for i in df.columns]
-                    df['price'] = df['close']
-                    return df
-            except Exception as e:
-                print(f"Error downloading prices for {ticker}: {e}")
-            return None
-
-        if concurrent_download:
-            # Use asyncio with ThreadPoolExecutor for concurrent downloads
-            async def download_all():
-                loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    tasks = [loop.run_in_executor(executor, download_one, ticker) for ticker in univ_list]
-                    results = await asyncio.gather(*tasks)
-                return [df for df in results if df is not None]
-
-            # Run the async function and get results
-            if sys.version_info >= (3, 7):
-                try:
-                    results = asyncio.run(download_all())
-                except RuntimeError:
-                    # If already in an event loop (e.g., Jupyter), use create_task
-                    results = asyncio.get_event_loop().run_until_complete(download_all())
-            else:
-                loop = asyncio.get_event_loop()
-                results = loop.run_until_complete(download_all())
-            price_data = results
-        else:
-            # Sequential fallback (original logic)
-            for ticker in univ_list:
-                df = download_one(ticker)
-                if df is not None:
-                    price_data.append(df)
-
-        if price_data:
-            df_price = pd.concat(price_data)
-            df_price['date'] = pd.to_datetime(df_price['date']).dt.date
-            df_price['return'] = df_price.groupby('sid')['price'].pct_change()
-            return df_price
-        else:
+    def get_portfolio(self, start_date: str|None=None, end_date: str|None=None, path: str|None=None) -> pd.DataFrame:
+        try:
+            if path is None:
+                path = "./data/time_series/portfolios/portfolio.csv" #".\data\time_series\portfolios\portfolio.csv"
+            df = pd.read_csv(path)
+            if start_date is not None:
+                df = df.loc[df.date>=start_date]
+            if end_date is not None:
+                df = df.loc[df.date<=end_date]
+            self.df_portfolio = df
+            return df
+        except:
+            print("Portfolio file missing.")
             return pd.DataFrame()
-
-    def _get_prices(self, univ_list: List[str]) -> pd.DataFrame:
+    
+    def _get_prices(self, univ_list: List[str], start_date:str|None=None, end_date:str|None=None) -> pd.DataFrame:
         """Helper function to get prices from Yahoo Finance."""
         import asyncio
         import concurrent.futures
@@ -1988,8 +1928,10 @@ class SecurityMasterYahoo(BaseModel):
                     concurrent_download = False
         
         price_data = []
-        start_date = min(self.dates)
-        end_date = max(self.dates)
+        if start_date is None:
+            start_date = min(self.config.dates)
+        if end_date is None:
+            end_date = max(self.config.dates)
         
         # def download_one(ticker, delay=0):
         def download_one(ticker: str, delay: Union[int, float]) -> Any:
@@ -2189,414 +2131,182 @@ class SecurityMasterYahoo(BaseModel):
             return df_price
         else:
             return pd.DataFrame()
+
+    def get_meta_data(self) -> pd.DataFrame:
+        """Get metadata from Yahoo Finance"""
+        import yfinance as yf
         
-    def get_returns_long(self) -> pd.DataFrame:
-        if self.df_price.empty:
+        if self.weights_data is None:
+            self.weights_data = self.get_benchmark_weights()
+        
+        if self.weights_data.empty:
             return pd.DataFrame()
-        df_ret_long = self.df_price[['date', 'sid', 'return', 'price']].copy()
-        df_ret_long['price'] = df_ret_long.groupby('sid').ffill()['price']
-        df_ret_long['return'] = df_ret_long['return'].fillna(0.0)
-        return df_ret_long
-
-    def get_returns_wide(self) -> pd.DataFrame:
-        if self.df_price.empty:
-            return pd.DataFrame()
-        df_ret_wide = self.df_price[['date', 'sid', 'return']].pivot(index='date', columns='sid', values='return')
-        df_ret_wide.fillna(0.0, inplace=True)
-        return df_ret_wide
-
-    def get_volume_long(self, n_window=22) -> pd.DataFrame:
-        if (self.df_price.shape[0] > 0) & ('volume' in self.df_price.columns):
-            df_volume = self.df_price[['date','sid','price','volume']].reset_index(drop=True).copy()
-            df_volume['volume_mm'] = df_volume['price'] * df_volume['volume']/1e6
-            df_volume.sort_values(by=['sid','date'], ascending=(True, True), inplace=True)
-
-            df_volume['volume_avg'] = df_volume.groupby('sid')['volume'].rolling(window=n_window).mean().reset_index(drop=True)
-            df_volume['volume_mm_avg'] = df_volume.groupby('sid')['volume_mm'].rolling(window=n_window).mean().reset_index(drop=True)
-            df_volume.fillna(0., inplace=True)
-            df_volume.reset_index(drop=True, inplace=True)
-            # display(df_volume.groupby(['sid']).tail(1).sort_values(['volume_mm_avg'], ascending=False).head())
-            return df_volume
         
-        return pd.DataFrame()
-
-def SecurityMasterFactory(model_input, *args) -> BaseModel:
-    data_source = model_input.backtest.data_source
-    universe = model_input.backtest.universe.value
-    dates_turnover = [] if model_input.backtest.dates_turnover==None else model_input.backtest.dates_turnover
-    dates_daily = [] if model_input.backtest.dates_daily==None else model_input.backtest.dates_daily
-    if data_source.lower() == 'yahoo':
-        concurrent_download = getattr(model_input.backtest, 'concurrent_download', None)
-        security_master = SecurityMasterYahoo(
-            universe=get_universe_mapping_yahoo(universe), 
-            dates=dates_daily,
-            dates_turnover=dates_turnover,
-            concurrent_download=concurrent_download
-        )
-        return security_master
-    elif data_source.lower() == 'bloomberg':
-        import bql
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        security_master = SecurityMasterBloomberg(
-            universe=universe, # 'NDX Index',
-            dates=dates_daily, # dates_month
-            dates_turnover=dates_turnover,
-            bq=bq  # Bloomberg Query instance
-            )
-        return security_master
-        # raise NotImplementedError("Bloomberg source not available in this context.")
-    else:
-        raise ValueError(f"Data source '{data_source}' is not supported.")
-
-class BQLFactor_v0(BaseModel):
-    """BQLFactor class for handling Bloomberg Query Language factor data"""
-    name: str
-    start_date: str
-    end_date: str
-    universe: List[str]
-    data: Optional[pd.DataFrame] = None
-    description: Optional[str] = None
-    category: Optional[str] = None
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    @field_validator('data', mode='before')
-    @classmethod
-    def validate_dataframe(cls, v: pd.DataFrame) -> pd.DataFrame:
-        if v is not None:
-            required_columns = {'date', 'factor_name', 'sid', 'value'}
-            if not all(col in v.columns for col in required_columns):
-                missing_cols = required_columns - set(v.columns)
-                raise ValueError(f"DataFrame missing required columns: {missing_cols}")
-        return v
-
-    def get_factor_data(self, factor_type: str | None = None, **kwargs) -> pd.DataFrame:
-        """
-        Get factor data using BQL
+        univ_list = list(self.weights_data['sid'].unique())
         
-        Args:            
-            factor_type: Type of factor to retrieve (size, value, momentum, etc.)
-        """
-        # if self.data is not None:
-        #     return self.data
-
-        if factor_type is None:
-            factor_type = self.name
-
-        try:
-            if factor_type == 'size':
-                df = self.get_factor_size()
-            elif factor_type == 'value':
-                df = self.get_factor_value()
-            elif factor_type == 'beta':
-                df = self.get_factor_beta()
-            elif factor_type == 'momentum':
-                df = self.get_factor_momentum(**kwargs)
-            elif factor_type == 'profit':
-                df = self.get_factor_profit()
-            elif factor_type == 'short_interest':
-                df = self.get_factor_short_interest()
-            elif factor_type == 'leverage':
-                df = self.get_factor_leverage()
-            elif factor_type == 'earnings_yield':
-                df = self.get_factor_earnings_yield()
-            else:
-                raise ValueError(f"Unsupported factor type: {factor_type}")
-            df.dropna(inplace=True)
+        meta_list = []
+        for ticker in univ_list:
             try:
-                df['date'] = df['date'].dt.date
-            except:
-                pass # print("BQL factor date in date format")
-
-            df.index = df['date']
-            # df = df.set_index('date')
-            df.index.name = 'index' 
-            return df
-        except Exception as e:
-            raise Exception(f"Error getting factor data: {str(e)}")
-    
-    def get_factor_beta(self) -> pd.DataFrame:
-        # import pdb; pdb.set_trace()
-        # set up the BQL API instance to query Bloomberg data
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        factor = 'beta'
-        #dates = bq.func.range("2022-12-31", "2025-01-21", frq='D')
-        dates = bq.func.range(self.start_date, self.end_date, frq='D')
-        trading_days = bq.data.px_last(dates=dates)
-        beta_2 = bq.data.BETA(dates=dates)
-        beta = bq.func.matches(beta_2,trading_days['value']!=bql.NA)
-        beta = beta.replacenonnumeric(np.nan)
-        request = {factor: beta}
-        # req = bql.Request(self.universe, request)
-        #req = bql.Request(['AAPL US Equity','IBM US Equity'], request)
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
-        df.reset_index(drop=False, inplace=True)
-        df[factor]=df.groupby('ID')[factor].ffill()
-        df.rename(columns={
-            'ID':'sid',
-            'DATE':'date',
-            factor:'value'},
-                  inplace=True)        
-        df.drop_duplicates(inplace=True)
-        df.insert(1, 'factor_name', factor)
-        df = df[['date','factor_name','sid','value']]
-        return df
-
-    def get_factor_earnings_yield(self) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        dates = bq.func.range(self.start_date, self.end_date, frq='D')
-        earn_yield = bq.data.EARN_YLD(fill='prev', dates=dates)
-        earn_yield = earn_yield.replacenonnumeric(np.nan)
-        request = {'earn_yield': earn_yield}
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
-        df.reset_index(drop=False, inplace=True)
-        df['earn_yield']=df.groupby('ID')['earn_yield'].ffill()
-        df.rename(columns={
-            'ID':'sid',
-            'AS_OF_DATE':'date',
-            'earn_yield':'value'},
-                  inplace=True)        
-        df.drop_duplicates(inplace=True)
-        df.insert(1, 'factor_name', 'earn_yield')
-        df['value'] = -df['value']
-        df = df[['date','factor_name','sid','value']]
-        return df
-    
-    def get_factor_leverage(self) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        dates = bq.func.range(self.start_date, self.end_date, frq='D')
-        lt_borrow = bq.data.BS_LT_BORROW(fill='prev', dates=dates)
-        tot_assets =  bq.data.BS_TOT_ASSET(fill='prev', fpt='ltm', dates = dates)
-        lev = (1./lt_borrow/tot_assets)*100.
-        lev = lev.replacenonnumeric(np.nan)
-        request = {'leverage': lev}
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
-        df.reset_index(drop=False, inplace=True)
-        df['leverage']=df.groupby('ID')['leverage'].ffill()
-        df.rename(columns={
-            'ID':'sid',
-            'AS_OF_DATE':'date',
-            'leverage':'value'},
-                  inplace=True)        
-        df.drop_duplicates(inplace=True)
-        df.insert(1, 'factor_name', 'leverage')
-        df = df[['date','factor_name','sid','value']]
-        return df
-    
-    def get_factor_short_interest(self) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        dates = bq.func.range(self.start_date, self.end_date, frq='D')
-        Short = bq.data.short_int(fill='prev', dates=dates)
-        ShsEqy = bq.data.eqy_sh_out(fill='prev', dates=dates)
-        ShsBs =  bq.data.bs_sh_out(fill='prev', fpt='ltm', dates = dates)
-        Shs = bq.func.max(ShsEqy, ShsBs)
-        si = (Short/Shs)*100.
-        si = si.replacenonnumeric(np.nan)
-        request = {'short_interest': si}
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
-        df.reset_index(drop=False, inplace=True)
-        df['short_interest']=df.groupby('ID')['short_interest'].ffill()
-        df.rename(columns={
-            'ID':'sid',
-            'DATE':'date',
-            'short_interest':'value'},
-                  inplace=True)        
-        df.drop_duplicates(inplace=True)
-        df.insert(1, 'factor_name', 'short_interest')
-        return df
+                info = self._get_ticker_info(ticker)
+                meta = SecurityMetaData(
+                    sid=ticker,
+                    name=info.get('longName', ticker),
+                    sector=info.get('sector', 'Unknown'),
+                    industry=info.get('industry'),
+                    country=info.get('country'),
+                    currency=info.get('currency')
+                )
+                meta_list.append(meta.model_dump())
+            except Exception as e:
+                logger.warning(f"Failed to get metadata for {ticker}: {e}")
+                meta_list.append({'sid': ticker, 'name': ticker, 'sector': 'Unknown'})
         
-    def get_factor_profit(self) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        factor = bq.data.normalized_profit_margin(dates=bq.func.range(self.start_date, self.end_date))
-        request = {'profit': factor}
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
-        df.reset_index(drop=False, inplace=True)
-        df.drop(columns='REVISION_DATE',inplace=True)
-        df['profit']=df.groupby('ID')['profit'].ffill()
-        # columns: REVISION_DATE,AS_OF_DATE,PERIOD_END_DATE,profit
-        df.rename(columns={
-            'ID':'sid',
-            'AS_OF_DATE':'date',
-            'PERIOD_END_DATE':'end_date',
-            'profit':'value'},
-                  inplace=True)        
-        df.drop_duplicates(inplace=True)
-        df.insert(1, 'factor_name', 'profit')
-        # Format date
-        # df['date'] = df['date'].astype(str)
-        # df['date'] = df['date'].map(lambda x: str(x).replace('-','') if len(x)==10 else x)
-        # import pdb; pdb.set_trace()
-        # df.index = df['date']
-        # df.index.name = 'index' 
-        # df['date'] = df['date'].map(lambda x: str(x.date()).replace('-','') if len(str(x.date()))==10 else str(x.date()))
-        df.dropna(inplace=True)
-        # df.reset_index(drop=True, inplace=True)
-        return df
+        meta_data = pd.DataFrame(meta_list)
+        meta_data.set_index('sid', inplace=True)
+        
+        self.meta_data = meta_data
+        return self.meta_data
     
-    def get_factor_size(self) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        factor = bq.data.cur_mkt_cap(dates=bq.func.range(self.start_date, self.end_date)).log()
-        request = {'size': factor}
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
-        df.drop_duplicates(inplace=True)
-        df.reset_index(drop=False, inplace=True)
-        # Rename and format columns
-        df = df[[f'DATE','ID','size']]
-        df['size'] = 1./df['size']
-        df.insert(1, 'factor_name', 'size')
-        df.rename(columns={
-            'DATE': 'date',
-            'ID': 'sid',
-            'size': 'value'
-        }, inplace=True)
-        # Format date
-        # df['date'] = df['date'].astype(str)
-        # df['date'] = df['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
-        # import pdb; pdb.set_trace()
-        # df['date'] = df['date'].map(lambda x: str(x.date()).replace('-','') if len(str(x.date()))==10 else str(x.date()))
-        df.dropna(inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
+    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
+        """Get sector dummy variables"""
+        if self.meta_data is None:
+            self.meta_data = self.get_meta_data()
         
-    def get_factor_value(self) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        request = {'price': bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date)),
-                   'book':bq.data.BOOK_VAL_PER_SH(dates=bq.func.range(self.start_date, self.end_date))}; 
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        # Process results
-        df = pd.concat([x.df().reset_index().set_index(['ID']) for x in res], axis=1)
-        df = df[['DATE','PERIOD_END_DATE','price','book']].ffill()
-        df['value'] = df['price']/df['book'] # 'price2book'
-        df.drop_duplicates(inplace=True)
-        df.reset_index(drop=False,inplace=True)
-        # Rename and format columns
-        df = df[[f'DATE','ID','value']]
-        df.insert(1, 'factor_name', 'value')
-        df.rename(columns={
-            'DATE': 'date',
-            'ID': 'sid',
-            'value': 'value'
-        }, inplace=True)
-        # Format date
-        # df['date'] = df['date'].astype(str)
-        # df['date'] = df['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
-        # import pdb; pdb.set_trace()
-        # df['date'] = df['date'].map(lambda x: str(x.date()).replace('-','') if len(str(x.date()))==10 else str(x.date()))
-        # df.dropna(inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
+        if self.meta_data.empty:
+            return pd.DataFrame()
         
-    def get_factor_momentum(self, **kwargs) -> pd.DataFrame:
-        import bql # bq: Bloomberg Query instance
-        bq = bql.Service(preferences={'currencyCheck':'when_available'})
-        if 'shift_lag' not in kwargs:
-            shift_lag = int(252/12)
-        else:
-            shift_lag = kwargs.get('shift_lag')
-        # factor = bq.data.px_last(dates=bq.func.range(self.start_date, self.end_date)).log()
-        start_date = str((datetime.datetime.strptime(self.start_date, '%Y-%m-%d') + timedelta(days = -shift_lag)).date())
-        factor = bq.data.px_last(dates=bq.func.range(start_date, self.end_date))
-        request = {'price': factor}
-        req = bql.Request(self.universe, request)
-        res = bq.execute(req)
-        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
-        df.reset_index(drop=False, inplace=True)
-        # import pdb; pdb.set_trace()
-        df.drop_duplicates(inplace=True)
-        df.sort_values(['ID','DATE'], inplace=True)
-        df['momentum'] = df.groupby(['ID'])['price'].pct_change(periods=shift_lag)
-
-        # Rename and format columns
-        df = df[[f'DATE','ID','momentum']]
-        df.insert(1, 'factor_name', 'momentum')
-        df.rename(columns={
-            'DATE': 'date',
-            'ID': 'sid',
-            'momentum': 'value'
-        }, inplace=True)
-        # Format date
-        # df['date'] = df['date'].astype(str)
-        # df['date'] = df['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
-        # import pdb; pdb.set_trace()
-        # df['date'] = df['date'].map(lambda x: str(x.date()).replace('-','') if len(str(x.date()))==10 else str(x.date()))
-        df.dropna(inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
+        if dummy_name not in self.meta_data.columns:
+            raise ValueError(f"Column '{dummy_name}' not found in metadata")
         
-    def get_returns(self, bq) -> pd.DataFrame:
-        """Get returns data for the universe"""
-        try:
-            import bql
-            returns = bq.data.return_holding_period(dates=bq.func.range(self.start_date, self.end_date))
-            request = {'return': returns}
-            req = bql.Request(self.universe, request)
-            res = bq.execute(req)
-            
-            df_ret = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) 
-                              for x in res], axis=1)
-            df_ret.reset_index(drop=False, inplace=True)
-            
-            # Format DataFrame
-            df_ret = df_ret[['DATE', 'ID', 'return']]
-            df_ret.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
-            # df_ret.index = df_ret['date']
-            df_ret = df_ret.set_index('date')
-            df_ret.index.name = 'index'
-            # df_ret['date'] = df_ret['date'].astype(str)
-            # df_ret['date'] = df_ret['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
-            
-            return df_ret
-            
-        except Exception as e:
-            raise Exception(f"Error getting returns data: {str(e)}")
+        df_dummies = pd.get_dummies(self.meta_data[dummy_name])
+        
+        # Clean column names
+        df_dummies.columns = [
+            col.replace(' ', '_').replace('&', 'and').replace('-', '_')
+            for col in df_dummies.columns
+        ]
+        
+        return df_dummies
 
-    def get_market_cap(self, bq) -> pd.DataFrame:
-        """Get market cap data for the universe"""
-        try:
-            import bql
-            mktcap = bq.data.market_cap(dates=bq.func.range(self.start_date, self.end_date))
-            request = {'mktcap': mktcap}
-            req = bql.Request(self.universe, request)
-            res = bq.execute(req)
-            
-            df_cap = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) 
-                              for x in res], axis=1)
-            df_cap.reset_index(drop=False, inplace=True)
-            
-            # Format DataFrame
-            df_cap = df_cap[['DATE', 'ID', 'mktcap']]
-            df_cap.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
-            df_cap.index = df_cap['date']
-            df_cap.index.name = 'index'
 
-            # df_cap
-            # df_cap['date'] = df_cap['date'].astype(str)
-            # df_cap['date'] = df_cap['date'].map(lambda x: x.replace('-','') if len(x)==10 else x)
+# ================================================================================
+# Factory Class
+# ================================================================================
+
+class SecurityMasterFactory:
+    """
+    Factory class for creating SecurityMaster instances.
+    
+    This factory ensures proper initialization and returns instances
+    with the ISecurityMaster interface, solving the original issue
+    of methods not being accessible.
+    """
+    
+    _implementations = {
+        DataSource.BLOOMBERG: SecurityMasterBloomberg,
+        DataSource.YAHOO: SecurityMasterYahoo,
+    }
+    
+    @classmethod
+    def create(cls, config: SecurityMasterConfig, **kwargs) -> ISecurityMaster:
+        """
+        Create a SecurityMaster instance based on configuration.
+        
+        Args:
+            config: SecurityMasterConfig with source and parameters
+            **kwargs: Additional source-specific parameters
             
-            return df_cap
+        Returns:
+            ISecurityMaster implementation instance
             
-        except Exception as e:
-            raise Exception(f"Error getting market cap data: {str(e)}")
+        Raises:
+            ValueError: If data source is not supported
+        """
+        if config.source not in cls._implementations:
+            raise ValueError(
+                f"Data source '{config.source}' is not supported. "
+                f"Available sources: {list(cls._implementations.keys())}"
+            )
+        
+        implementation_class = cls._implementations[config.source]
+        
+        # Create instance with config and additional parameters
+        instance = implementation_class(config=config, **kwargs)
+        
+        logger.info(f"Created {config.source.value} SecurityMaster instance")
+        
+        return instance
+    
+    @classmethod
+    def register_implementation(cls, source: DataSource, implementation_class: type):
+        """
+        Register a new data source implementation.
+        
+        Args:
+            source: DataSource enum value
+            implementation_class: Class implementing ISecurityMaster
+        """
+        if not issubclass(implementation_class, ISecurityMaster):
+            raise TypeError(
+                f"Implementation class must inherit from ISecurityMaster"
+            )
+        
+        cls._implementations[source] = implementation_class
+        logger.info(f"Registered {source.value} implementation")
+
+
+# ================================================================================
+# Custom Implementation Example
+# ================================================================================
+
+class SecurityMasterCustom(BaseSecurityMaster):
+    """
+    Template for custom data source implementation.
+    
+    Inherit from this class and implement the abstract methods
+    for your specific data source.
+    """
+    
+    data_connection: Optional[Any] = None
+    
+    def __init__(self, **data):
+        """Initialize custom SecurityMaster"""
+        super().__init__(**data)
+        self._connect_to_data_source()
+    
+    def _connect_to_data_source(self):
+        """Connect to custom data source"""
+        # Implement your connection logic here
+        logger.info("Connecting to custom data source...")
+    
+    def get_benchmark_weights(self) -> pd.DataFrame:
+        """Implement custom benchmark weights retrieval"""
+        raise NotImplementedError("Implement this method for your data source")
+    
+    def get_benchmark_prices(self, start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        """Implement custom benchmark prices retrieval"""
+        raise NotImplementedError("Implement this method for your data source")
+    
+    def get_members_prices(self, tickers: List[str]=[], start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
+        """Implement custom member prices retrieval"""
+        raise NotImplementedError("Implement this method for your data source")
+    
+    def get_security_master(self) -> pd.DataFrame:
+        """Implement custom security master retrieval"""
+        raise NotImplementedError("Implement this method for your data source")
+    
+    def get_meta_data(self) -> pd.DataFrame:
+        """Implement custom metadata retrieval"""
+        raise NotImplementedError("Implement this method for your data source")
+    
+    def get_sector_dummies(self, dummy_name: str = 'sector') -> pd.DataFrame:
+        """Implement custom sector dummies creation"""
+        raise NotImplementedError("Implement this method for your data source")
+
+# ================================================================================
+# Factor classes
+# ================================================================================
+
 
 class BQLFactor(BaseModel):
     """BQLFactor class for handling Bloomberg Query Language factor data"""
@@ -5622,7 +5332,7 @@ def FactorFactory(factor_type: str, model_input, *args) -> BaseModel: # dates,
 def get_rebalance_dates(
     model_input: EquityFactorModelInput,
     return_as: str = "str",  # or "date"
-    frq:Frequency = None,
+    frq:Frequency = Frequency.MONTHLY,
     ) -> List[Union[str, date]]:
     start = model_input.backtest.start_date
     end = model_input.backtest.end_date
@@ -6052,12 +5762,6 @@ def generate_config_id(config: dict, prefix: Optional[str] = None) -> str:
 
 # Example usage:
 if __name__ == "__main__":
-    # Configure logging to see outputs
-    logging.basicConfig(level=logging.INFO)
-
-    from file_data_manager import (
-        FileConfig, FileDataManager 
-        )
     # test_yahooFactor()
     
     cfg = FileConfig()
@@ -6080,7 +5784,7 @@ if __name__ == "__main__":
         ),
         backtest=BacktestConfig(
             data_source = DataSource.YAHOO, # 'yahoo',
-            universe=Universe.SPX,  # Universe.INDU: Dow Jones Industrial Average # 'SEMLMCUP Index', 'NDX Index'
+            universe=Universe.INDU,  # Universe.INDU: Dow Jones Industrial Average # 'SEMLMCUP Index', 'NDX Index'
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
             start='2023-12-31', # '2023-12-31',
@@ -6089,7 +5793,7 @@ if __name__ == "__main__":
             concurrent_download = True
         ),
         regime=RegimeConfig(
-            type='vol',
+            type=RegimeType.VOLATILITY,
             benchmark=VolatilityType.VIX, # 'VIX Index',
             periods=10
         ),
@@ -6106,7 +5810,7 @@ if __name__ == "__main__":
     update_history = model_input.export.update_history
 
     # Get portfolio turnover dates: model_input.backtest.dates_turnover
-    set_model_input_dates_turnover(model_input)
+    set_model_input_dates_turnover(model_input) # model_input.backtest.dates_turnover
 
     # Validate and access the config
     print(model_input.model_dump_json(indent=2))
@@ -6130,9 +5834,26 @@ if __name__ == "__main__":
     """
     # Get security master object
     """
-    security_master = SecurityMasterFactory(
-        model_input=model_input
-        )
+    # Create Yahoo Finance SecurityMaster
+    config_yahoo = SecurityMasterConfig(
+        source = model_input.backtest.data_source, # DataSource.YAHOO,
+        universe = get_universe_mapping_yahoo(model_input.backtest.universe), # "^SPX",
+        dates = model_input.backtest.dates_daily,
+        dates_turnover = model_input.backtest.dates_turnover
+    )
+    
+    # Create instance using factory
+    security_master = SecurityMasterFactory.create(config_yahoo)
+    
+    # Now all methods are accessible through the interface
+    # weights = security_master.get_benchmark_weights()
+    # prices = security_master.get_benchmark_prices("2024-01-01", "2024-01-31")
+    # stats = security_master.get_universe_stats()    
+    # print(f"Universe Statistics: {stats}")
+
+    # security_master = SecurityMasterFactory(
+    #     model_input=model_input
+    #     )
     identifier = f"{model_input.backtest.universe.value.replace(' ','_')}"
         
     # Get benchmark prices
@@ -6163,7 +5884,7 @@ if __name__ == "__main__":
     # Get portfolios: NOTE -> should be generated by another program and follow format below:
     # index         date       ticker  sid  exchange  sector     weight
     # 2025-03-31  2025-03-31   WMT     WMT  NYSE      Retailing  0.033333
-    df_portfolio = security_master.get_portfolio(model_input)
+    df_portfolio = security_master.get_portfolio()
     model_input.backtest.portfolio_list = sorted(list(df_portfolio['sid'].unique()))
     print("\nSecurity Master Portfolio:")
     print(df_portfolio.tail(3)) # security_master.df_portfolio.tail(3))
@@ -6177,7 +5898,7 @@ if __name__ == "__main__":
 
     # Get benchmark members' prices
     if update_history:
-        df_prices = security_master.get_members_prices(model_input)
+        df_prices = security_master.get_members_prices(tickers=model_input.backtest.universe_list) # (model_input)
     else:
         df_prices = mgr.load_prices(identifier+'_members')
         security_master.df_price = df_prices
@@ -6188,7 +5909,7 @@ if __name__ == "__main__":
     # Get security master with BICS sectors
     if update_history:
         if security_master.security_master is None:
-            sec_master = security_master.get_security_master(sector_classification='BICS')
+            sec_master = security_master.get_security_master(sector_classification='GICS')
         else:
             sec_master = security_master.security_master.copy()
         print("\nSecurity Master Sample:")
@@ -6234,8 +5955,7 @@ if __name__ == "__main__":
     print("\nFactors in Model:")
     print(factor_list)
 
-    if 'factor_dict' not in locals():
-        factor_dict = {}
+    factor_dict = {}
     
     if update_history:
         for factor_type in factor_list: # [:1]
@@ -6377,7 +6097,8 @@ if __name__ == "__main__":
                 df_exposures = df_exposures.merge(df, how='left', on=['date','sid'])
 
         df_exposures.dropna(inplace=True)
-        df_exposures.index = df_exposures['date']
+        # df_exposures.index = df_exposures['date']
+        df_exposures.index = df_exposures.date
         df_exposures.index.name = None
 
         df_exposures_long = pd.melt(df_exposures, id_vars=['date','sid'], value_name='exposure')
@@ -6454,6 +6175,7 @@ if __name__ == "__main__":
             model_input.backtest.dates_turnover # [str(i) for i in dates_to]
         )
         df_portfolio = results_opt.get('weights_data')
+        df_portfolio = pd.DataFrame(df_portfolio)
         
         config = bt.BacktestConfig(
             asset_class=bt.AssetClass.EQUITY,
@@ -6476,7 +6198,7 @@ if __name__ == "__main__":
         
     # factor returns
     df_pure_return_wide = df_pure_return[['factor','return_opt']].pivot(columns='factor',values='return_opt')
-    df_pure_return_wide.cumsum().plot(title=f"Pure Factor Returns: {security_master.universe}", rot=45, figsize=(16,8))
+    df_pure_return_wide.cumsum().plot(title=f"Pure Factor Returns: {security_master.config.universe}", rot=45, figsize=(16,8))
     plt.savefig(f"plot_pure_factor_returns_{identifier}.png")
     print(df_pure_return_wide.corr())
     print(252*df_pure_return_wide.mean())

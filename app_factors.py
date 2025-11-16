@@ -27,9 +27,12 @@ from qFactor import (
     EquityFactor, EquityFactorModelInput, RiskFactors, 
     ParamsConfig, BacktestConfig, RegimeConfig, ExportConfig, OptimizationConfig,
     Universe, Currency, Frequency, DataSource, VolatilityType, RegimeType,
-    SecurityMasterFactory, FactorFactory, get_rebalance_dates, set_model_input_dates_turnover,
-    set_model_input_dates_daily, merge_weights_with_factor_loadings
+    SecurityMasterFactory, SecurityMasterConfig, ISecurityMaster, BaseSecurityMaster,
+    FactorFactory, get_rebalance_dates, set_model_input_dates_turnover,
+    set_model_input_dates_daily, merge_weights_with_factor_loadings, 
+    get_universe_mapping_yahoo
 )
+
 from etl_universe_data import etl_universe_data
 
 from file_data_manager import (
@@ -320,7 +323,18 @@ def run_tracking_error_optimization() -> Dict:
         
         # Create security master for benchmark returns
         # model_input.backtest.dates_turnover = [str(i.date()) for i in model_input.backtest.dates_turnover]
-        security_master = SecurityMasterFactory(model_input=model_input)
+        # Create Yahoo Finance SecurityMaster
+        config_yahoo = SecurityMasterConfig(
+            source = model_input.backtest.data_source, # DataSource.YAHOO,
+            universe = get_universe_mapping_yahoo(model_input.backtest.universe), # "^SPX",
+            dates = model_input.backtest.dates_daily,
+            dates_turnover = model_input.backtest.dates_turnover
+        )
+    
+        # Create instance using factory
+        # security_master = SecurityMasterFactory(model_input=model_input)
+        security_master = SecurityMasterFactory.create(config_yahoo)
+
         security_master.df_price = mgr.load_prices(identifier+'_members')
         security_master.df_bench = df_benchmark_prices
         security_master.weights_data = df_benchmark_weights
@@ -718,7 +732,7 @@ def run_portfolio_optimization() -> Dict:
         return None
 
 
-def run_pure_factor_optimization() -> Dict:
+def run_pure_factor_optimization() -> Dict | None:
     """
     Run pure factor portfolio optimization for all selected factors.
     
@@ -765,7 +779,18 @@ def run_pure_factor_optimization() -> Dict:
         if model_input.params.sector_neutral:
             try:
                 # Try to load sector dummies from security master if available
-                security_master = SecurityMasterFactory(model_input=model_input)
+                # Create Yahoo Finance SecurityMaster
+                config_yahoo = SecurityMasterConfig(
+                    source = model_input.backtest.data_source, # DataSource.YAHOO,
+                    universe = get_universe_mapping_yahoo(model_input.backtest.universe), # "^SPX",
+                    dates = model_input.backtest.dates_daily,
+                    dates_turnover = model_input.backtest.dates_turnover
+                )
+            
+                # Create instance using factory
+                # security_master = SecurityMasterFactory(model_input=model_input)
+                security_master = SecurityMasterFactory.create(config_yahoo)
+
                 security_master.df_price = mgr.load_prices(identifier+'_members')
                 if security_master.meta_data is None or security_master.meta_data.empty:
                     security_master.get_meta_data(sector_classification=model_input.params.sector_classification)
@@ -1944,13 +1969,13 @@ with st.sidebar:
             key="tracking_error"
         ) / 100
     
-    max_weight = st.slider(
-        "Max Position Weight (%)", 
-        min_value=1, 
-        max_value=20, 
-        value=5,
-        key="weight_max"
-    ) / 100
+    # max_weight = st.slider(
+    #     "Max Position Weight (%)", 
+    #     min_value=1, 
+    #     max_value=20, 
+    #     value=5,
+    #     key="weight_max"
+    # ) / 100
     
     # AUM
     aum = st.number_input(

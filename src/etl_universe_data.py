@@ -13,10 +13,10 @@ from pathlib import Path
 # Import from qFactor.py
 from qFactor import (
     EquityFactorModelInput, ParamsConfig, BacktestConfig, RegimeConfig, OptimizationConfig, ExportConfig,
-    RiskFactors, Universe, Currency, Frequency, EquityFactor, VolatilityType,
+    RiskFactors, Universe, Currency, Frequency, EquityFactor, VolatilityType, SecurityMasterConfig,
     SecurityMasterFactory, FactorFactory, get_rebalance_dates, generate_config_id,
     set_model_input_start, set_model_input_dates_turnover, set_model_input_dates_daily,
-    merge_weights_with_factor_loadings
+    merge_weights_with_factor_loadings, RegimeType
 )
 
 from file_data_manager import (
@@ -124,7 +124,18 @@ def etl_universe_data(model_input, progress_callback=None):
         current_step += 1
         update_progress(current_step, total_steps, "Step 2: Initializing Security Master...")
         # 2. Get security master
-        security_master = SecurityMasterFactory(model_input=model_input)
+        # Create Yahoo Finance SecurityMaster
+        from qFactor import get_universe_mapping_yahoo
+        config_yahoo = SecurityMasterConfig(
+            source=model_input.backtest.data_source, # DataSource.YAHOO,
+            universe=get_universe_mapping_yahoo(model_input.backtest.universe), # "^SPX",
+            dates=model_input.backtest.dates_daily,
+            dates_turnover=model_input.backtest.dates_turnover
+            )
+    
+        # Create instance using factory
+        # security_master = SecurityMasterFactory(model_input=model_input)
+        security_master = SecurityMasterFactory.create(config_yahoo)
         update_progress(current_step, total_steps, "Security Master initialized successfully", "success")
 
         current_step += 1
@@ -154,7 +165,7 @@ def etl_universe_data(model_input, progress_callback=None):
         update_progress(current_step, total_steps, "Step 4: Downloading member securities data...")
         # 2.3 Get benchmark members' prices and returns
         update_progress(current_step, total_steps, "   💰 Downloading member prices...")
-        df_prices = security_master.get_members_prices(model_input)
+        df_prices = security_master.get_members_prices(tickers=model_input.backtest.universe_list)
         update_progress(current_step, total_steps, f"   Member prices: {len(df_prices)} records", "success")
         
         update_progress(current_step, total_steps, "   📊 Calculating returns...")
@@ -286,7 +297,7 @@ if __name__ == "__main__":
         ),
         backtest=BacktestConfig(
             data_source='yahoo',
-            universe=Universe.SPX, # INDU, NDX, SPX
+            universe=Universe.NDX, # INDU, NDX, SPX
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
             start='2013-12-31', # '2022-12-31',
@@ -294,7 +305,7 @@ if __name__ == "__main__":
             concurrent_download = False
         ),
         regime=RegimeConfig(
-            type='vol',
+            type=RegimeType.VOLATILITY,
             benchmark=VolatilityType.VIX,
             periods=10
         ),

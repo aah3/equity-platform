@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 from datetime import datetime, date
 import pandas as pd
 import numpy as np
-import cvxpy as cp
+import cvxpy as cp # Visit dcp.stanford.edu for a more interactive introduction to DCP.
 from dataclasses import dataclass
 from enum import Enum
 import logging
@@ -740,11 +740,7 @@ class TrackingErrorOptimizer(BaseModel):
         """Set up the CVXPY optimization problem"""
         n_assets = returns.shape[1]
         w = cp.Variable(n_assets)
-        
-        # Boolean variables for position counting if using integer constraints
-        if self.use_integer_constraints:
-            wi = cp.Variable(n_assets, boolean=True)
-        
+                
         # Calculate returns matrices
         mu = np.array(returns)
         bench_returns = np.array(benchmark_returns['return'])
@@ -783,8 +779,10 @@ class TrackingErrorOptimizer(BaseModel):
                     (w @ exposures[factor]) <= (bench_exposure + constraint)
                 ])
         
+        # Boolean variables for position counting if using integer constraints            
         # Position limits using integer constraints
         if self.use_integer_constraints:
+            wi = cp.Variable(n_assets, boolean=True)
             constraint_list.extend([
                 w <= wi,
                 cp.sum(wi) >= constraints.max_names
