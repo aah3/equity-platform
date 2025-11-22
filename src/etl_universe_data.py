@@ -185,7 +185,7 @@ def etl_universe_data(model_input, progress_callback=None):
             df = factor.get_factor_data()
             if df_benchmark_weights.shape[0]>0:
                 df = merge_weights_with_factor_loadings(df_benchmark_weights, df)
-                df = df[['date','factor_name','sid','value']]
+                df = pd.DataFrame(df[['date','factor_name','sid','value']])
             factor_eq = None
             if not df.empty:
                 factor_eq = EquityFactor(

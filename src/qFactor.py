@@ -17,6 +17,7 @@ from enum import Enum
 from decimal import Decimal
 
 import os
+import sys
 import datetime
 import pandas as pd
 import numpy as np
@@ -31,11 +32,48 @@ import seaborn as sns
 import scipy.sparse as sp
 import statsmodels.api as sm
 import logging # Good practice to log errors
-# import bql 
+import warnings
+# Try to import the actual BQL library, fall back to mock if not available
+try:
+    import mock_bql as bql # import bql # replace with real bql library if available
+    USING_MOCK_BQL = False
+except ImportError:
+    # Add the directory containing mock_bql to the Python path if needed
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    
+    import mock_bql as bql
+    USING_MOCK_BQL = True
+    warnings.warn(
+        "Bloomberg BQL not available. Using mock implementation. "
+        "Install Bloomberg API and replace with actual BQL for production use.",
+        ImportWarning
+        )
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# 1. Configure logging: log msgs with a level of INFO (and higher: WARNING, ERROR, CRITICAL) will be displayed.
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    filename='app.log', # <--- This creates the FileHandler
+    filemode='w' # Overwrite the file each time the program starts
+    )
+# 2. Get the specific logger instance
 logger = logging.getLogger(__name__)
+
+# 3. Create a StreamHandler for the console (stdout/stderr)
+# Note: We must create a separate handler to direct output to the console.
+console_handler = logging.StreamHandler(sys.stdout)
+
+# 4. Set the log level for the console handler
+console_handler.setLevel(logging.INFO) 
+
+# 5. Define the format for the console output (optional: can be different from file)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+console_handler.setFormatter(formatter)
+
+# 6. Add the console handler to the logger
+logger.addHandler(console_handler)
 
 from qOptimization import (PurePortfolioConstraints, PureFactorOptimizer)
 # from utils import *
@@ -636,28 +674,6 @@ class WeightingScheme(str, Enum):
     RISK_WEIGHT = "risk_wgt"
     CUSTOM = "custom"
 
-class ParamsConfig_v0(BaseModel):
-    """Configuration for general parameters"""
-    aum: Decimal = Field(gt=0, description="Assets under management in millions of local currency")
-    sigma_regimes: bool = Field(default=False, description="Whether to use regime-dependent covariances")
-    risk_factors: List[RiskFactors] = Field(
-        default_factory=lambda: [RiskFactors.BETA, RiskFactors.SIZE, RiskFactors.MOMENTUM, RiskFactors.VALUE],
-        description="List of risk factors to include in the model"
-    )
-    bench_weights: Optional[WeightingScheme] = Field(
-        default=None,
-        description="Benchmark weighting scheme"
-    )
-    n_dates: Optional[int] = Field(default=None,
-                                  description="Number of dates in backtest")
-    n_sids: Optional[int] = Field(default=None,
-                                  description="Number of securities in backtest")
-    n_buckets: Optional[int] = Field(default=None,
-                                  description="Number of buckets for percentile portfolios.")    
-    @field_validator('risk_factors')
-    def sort_risk_factors(cls, v):
-        return sorted(v)
-
 RF = TypeVar("RF")
 class ParamsConfig(BaseModel, Generic[RF]):
     """Configuration for general parameters, parametrized over RF."""
@@ -697,7 +713,7 @@ class ParamsConfig(BaseModel, Generic[RF]):
 
 class BacktestConfig(BaseModel):
     """Configuration for backtest parameters"""
-    data_source: str = Field(
+    data_source: DataSource = Field( # str
         default=DataSource.YAHOO, # 'yahoo',
         alias='data_source',
         description="Source to retrieve data from, i.e. Yahoo, Bloomberg, Reuters..."
@@ -732,22 +748,22 @@ class BacktestConfig(BaseModel):
         description="Time zone for analysis"
     )
     dates_daily: Optional[list] = Field(
-        default=None,
+        default=[],
         alias='dates_daily',
         description="Daily business dates list"
     )
     dates_turnover: Optional[list] = Field(
-        default=None,
+        default=[],
         alias='dates_turnover',
         description="Turnover dates list"
     )
     universe_list: Optional[list] = Field(
-        default=None,
+        default=[],
         alias='univ_list',
         description="Securities ids list"
     )
     portfolio_list: Optional[list] = Field(
-        default=None,
+        default=[],
         alias='portfolio_list',
         description="Portfolio's securities ids list"
     )
@@ -995,6 +1011,14 @@ class ISecurityMaster(ABC):
     This ensures all data source implementations provide the same methods,
     solving the factory pattern issue where methods weren't accessible.
     """
+    
+    # Common data attributes that all implementations should have
+    # These are declared here for type checking purposes
+    # Actual implementation is in BaseSecurityMaster
+    df_bench: pd.DataFrame
+    df_price: pd.DataFrame
+    security_master: pd.DataFrame
+    weights_data: Optional[pd.DataFrame]
     
     @abstractmethod
     def get_benchmark_weights(self) -> pd.DataFrame:
@@ -1262,12 +1286,13 @@ class BaseSecurityMaster(BaseModel, ISecurityMaster):
         stats = UniverseStats(
             n_dates=len(self.config.dates),
             n_securities=len(self.weights_data['sid'].unique()),
-            avg_weight_sum=self.weights_data.groupby('date')['weight'].sum().mean(),
+            avg_weight_sum=float(self.weights_data.groupby('date')['weight'].sum().mean()),
             dates_range=f"{min(self.config.dates)} to {max(self.config.dates)}"
         )
         
         if self.security_master is not None:
-            stats.sectors = self.security_master['sector'].unique().tolist()
+            # stats.sectors = self.security_master['sector'].unique().tolist()
+            stats.sectors = list(self.security_master['sector'].unique())
             stats.sectors_count = len(stats.sectors)
         
         return stats
@@ -1294,7 +1319,6 @@ class SecurityMasterBloomberg(BaseSecurityMaster):
     def _initialize_bloomberg(self):
         """Initialize Bloomberg Query Language connection"""
         try:
-            import bql
             self.bq = bql.Service(preferences={'currencyCheck': 'when_available'})
             logger.info("Bloomberg BQL connection established")
         except ImportError:
@@ -1303,9 +1327,7 @@ class SecurityMasterBloomberg(BaseSecurityMaster):
     
     def get_benchmark_weights(self) -> pd.DataFrame:
         """Get benchmark weights from Bloomberg"""
-        try:
-            import bql
-            
+        try:            
             data_items = {
                 'Name': self.bq.data.name()['VALUE'],
                 'Weights': self.bq.data.id()['WEIGHTS']
@@ -1337,8 +1359,6 @@ class SecurityMasterBloomberg(BaseSecurityMaster):
     def get_benchmark_prices(self, start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
         """Get benchmark prices from Bloomberg"""
         try:
-            import bql
-            
             px_last = self.bq.data.px_last(
                 dates=self.bq.func.range(start_date, end_date),
                 frq='d',
@@ -1362,9 +1382,7 @@ class SecurityMasterBloomberg(BaseSecurityMaster):
     
     def get_members_prices(self, tickers: List[str]=[], start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
         """Get member prices from Bloomberg"""
-        try:
-            import bql
-            
+        try:            
             # Define data items
             px_last = self.bq.data.px_last(
                 dates=self.bq.func.range(start_date, end_date),
@@ -1400,7 +1418,6 @@ class SecurityMasterBloomberg(BaseSecurityMaster):
                 'volume': volume,
                 'return': ret
             }
-            
             req = bql.Request(tickers, request)
             res = self.bq.execute(req)
             
@@ -1445,9 +1462,7 @@ class SecurityMasterBloomberg(BaseSecurityMaster):
     
     def get_meta_data(self) -> pd.DataFrame:
         """Get metadata from Bloomberg"""
-        try:
-            import bql
-            
+        try:            
             if self.weights_data is None:
                 self.weights_data = self.get_benchmark_weights()
             
@@ -1791,8 +1806,8 @@ class SecurityMasterYahoo(BaseSecurityMaster):
         if not df_weights.empty:
             if 'sid' not in df_weights.columns:
                 df_weights['sid'] = df_weights['ticker']
-            # df_weights = df_weights.set_index('date')
-            df_weights.index = df_weights['date']
+            df_weights = df_weights.set_index('date', drop=False)
+            # df_weights.index = df_weights['date']
             df_weights.index.name = 'index'
             # Ensure 'weight' column exists and is a float
             if 'wgt' in df_weights.columns:
@@ -1830,7 +1845,8 @@ class SecurityMasterYahoo(BaseSecurityMaster):
         sec_master = self.weights_data.copy()
         # sec_master.insert(2, 'id', sec_master['sid'])
         # sec_master['sid'] = sec_master['sid']
-        sec_master.insert(1, 'yy', sec_master['date'].map(lambda x: x[:4]))
+        # sec_master.insert(1, 'yy', sec_master['date'].map(lambda x: x[:4]))
+        sec_master.insert(1, 'yy', sec_master['date'].str[:4])
 
         if 'sector' not in sec_master.columns:
             sector_data = []
@@ -1873,7 +1889,7 @@ class SecurityMasterYahoo(BaseSecurityMaster):
                           .unstack()
                           .fillna(0))
 
-        return sector_weights
+        return pd.DataFrame(sector_weights)
 
     def get_benchmark_prices(self, start_date: str|None=None, end_date: str|None=None) -> pd.DataFrame:
         if self.config.universe is not None:
@@ -2077,9 +2093,10 @@ class SecurityMasterYahoo(BaseSecurityMaster):
                 result_queue = queue.Queue()
                 
                 def thread_target():
+                    loop = asyncio.new_event_loop()
                     try:
                         # Create new event loop in thread
-                        loop = asyncio.new_event_loop()
+                        # loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         result = loop.run_until_complete(download_all())
                         result_queue.put(('success', result))
@@ -2307,8 +2324,29 @@ class SecurityMasterCustom(BaseSecurityMaster):
 # Factor classes
 # ================================================================================
 
+class IFactor(ABC):
+    """
+    Abstract base class defining the interface for Factor implementations.
+    
+    This ensures all factor implementations provide the same methods,
+    solving the factory pattern issue where methods weren't accessible.
+    """
+    
+    @abstractmethod
+    def get_factor_data(self, *args, **kwargs) -> pd.DataFrame:
+        """
+        Get factor data.
+        
+        Args:
+            *args: Variable positional arguments (e.g., bq for BQLFactor)
+            **kwargs: Variable keyword arguments including factor_type
+            
+        Returns:
+            DataFrame with factor data in standardized format
+        """
+        pass
 
-class BQLFactor(BaseModel):
+class BQLFactor(BaseModel, IFactor):
     """BQLFactor class for handling Bloomberg Query Language factor data"""
     name: str
     start_date: str
@@ -2331,7 +2369,7 @@ class BQLFactor(BaseModel):
                 raise ValueError(f"DataFrame missing required columns: {missing_cols}")
         return v
 
-    def get_factor_data(self, bq, factor_type: str = None, **kwargs) -> pd.DataFrame:
+    def get_factor_data(self, bq, factor_type: str | None = None, **kwargs) -> pd.DataFrame:
         """
         Get factor data using BQL
         
@@ -2376,7 +2414,8 @@ class BQLFactor(BaseModel):
             else:
                 raise ValueError(f"Unsupported factor type: {factor_type}")
             df.dropna(inplace=True)
-            df.index = df['date']
+            # df.index = df['date']
+            df = df.set_index('date', drop=False)
             df.index.name = 'index' 
             return df
         except Exception as e:
@@ -2462,6 +2501,7 @@ class BQLFactor(BaseModel):
                 - factor_name (str): 'beta'.
                 - value (float): value from beta field.
         """
+        from datetime import datetime
         factor = 'beta'
         n_days = 252+1;
         start_date = datetime.strptime(self.start_date, "%Y-%m-%d")-timedelta(days=n_days);
@@ -3257,7 +3297,8 @@ class BQLFactorAsync(BaseModel):
             else:
                 raise ValueError(f"Unsupported factor type: {factor_type}")
             df.dropna(inplace=True)
-            df.index = df['date']
+            # df.index = df['date']
+            df = df.set_index('date', drop=False)
             df.index.name = 'index' 
             return df
         except Exception as e:
@@ -3446,24 +3487,6 @@ class BQLFactorAsync(BaseModel):
         df = df[['date','factor_name','sid','value']]
         return df
 
-    async def get_factor_momentum_v0(self, bq, shift_lag: int = 21) -> pd.DataFrame:
-        start_date = str((datetime.strptime(self.start_date, '%Y-%m-%d') - timedelta(days=shift_lag)).date())
-        factor = bq.data.px_last(dates=bq.func.range(start_date, self.end_date), currency=self.currency)
-        request = {'price': factor}
-        req = bql.Request(self.universe, request)
-        res = await asyncio.to_thread(bq.execute, req)
-
-        df = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID']) for x in res], axis=1)
-        df.reset_index(inplace=True)
-        df.drop_duplicates(inplace=True)
-        df.sort_values(['ID', 'DATE'], inplace=True)
-        df['momentum'] = df.groupby('ID')['price'].pct_change(periods=shift_lag)
-        df = df[['DATE', 'ID', 'momentum']]
-        df.insert(1, 'factor_name', 'momentum')
-        df.rename(columns={'DATE': 'date', 'ID': 'sid', 'momentum': 'value'}, inplace=True)
-        df.dropna(inplace=True)
-        return df.reset_index(drop=True)
-
     async def get_factor_st_momentum(self, bq) -> pd.DataFrame:
         """
         Retrieve momentum for a list of securities over a backtest date range and map them to numeric values.
@@ -3571,9 +3594,10 @@ class BQLFactorAsync(BaseModel):
         df['value'] = df['price'] / df['book']
         df.drop_duplicates(inplace=True)
         df.reset_index(drop=False, inplace=True)
-        df = df[['DATE', 'ID', 'value']]
+        df = pd.DataFrame(df[['DATE', 'ID', 'value']])
         df.insert(1, 'factor_name', 'value')
-        df.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+        # df.rename(columns={'DATE': 'date', 'ID': 'sid'}, inplace=True)
+        df = df.rename(columns={'DATE': 'date', 'ID': 'sid'})
         return df.reset_index(drop=True)
 
     async def get_factor_beta_v0(self, bq) -> pd.DataFrame:
@@ -3602,7 +3626,7 @@ class BQLFactorAsync(BaseModel):
         df['value'] = df.groupby('sid')['value'].ffill().fillna(1.0)
         df.drop_duplicates(['date', 'sid'], inplace=True)
         df.insert(1, 'factor_name', factor)
-        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+        return pd.DataFrame(df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True))
 
     async def get_factor_beta_v1(self, bq) -> pd.DataFrame:
         """
@@ -3641,60 +3665,6 @@ class BQLFactorAsync(BaseModel):
         df = df[['date','factor_name','sid','value']]
         return df
         
-    async def get_factor_beta_v4(self, bq) -> pd.DataFrame:
-        """
-        Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
-
-        Args:
-            model_input: An object with a `backtest` attribute containing `start_date` and `end_date`.
-            universe_list: List of security tickers (e.g., ["AAPL US Equity", "IBM US Equity"]).
-
-        Returns:
-            pd.DataFrame: A DataFrame with columns:
-                - date (pd.Timestamp): The date of the rating.
-                - sid (str): Security identifier.
-                - factor_name (str): 'beta'.
-                - value (float): value from beta field - use monthly betas and ffill intramonth.
-        """
-        factor = 'beta'
-        # daily data
-        dates_daily = bq.func.range(self.start_date, self.end_date, frq='D')
-        px_last = bq.data.px_last(dates=dates_daily, frq='d', ca_adj='full').dropna();
-        request = {'price':px_last};
-        req = bql.Request(['SPX Index'], request);
-        # res = bq.execute(req);
-        res = await asyncio.to_thread(bq.execute, req)
-        df_price = pd.concat([x.df()[['DATE', x.name]].reset_index().set_index(['DATE', 'ID'])  for x in res], axis=1);
-        df_price.reset_index(drop=False,inplace=True)
-        df_price.columns = ['date','sid','price']
-        df_price = pd.DataFrame(product(list(df_price.dropna().date.unique()), self.universe));
-        df_price.columns = ['date','sid'];
-        
-        # monthly data
-        dates = bq.func.range(self.start_date, self.end_date, frq='M')
-        beta = bq.data.beta(dates=dates)
-        request = {'beta': beta}
-        req = bql.Request(self.universe, request)
-        # res = bq.execute(req)
-        res = await asyncio.to_thread(bq.execute, req)
-        df = res[0].df()
-        df.reset_index(drop=False, inplace=True)
-        df.rename(columns={'ID':'sid','DATE':'date'}, inplace=True)
-        
-        df['beta'] = df.groupby('sid')['beta'].ffill().fillna(1.)
-        df['value'] = df['beta']
-        df.sort_values(by=['sid', 'date'], inplace=True);
-
-        df = df_price.merge(df, how='left', on=['date','sid']);
-        df.sort_values(by=['sid', 'date'], inplace=True);
-        df['sid'] = df['sid'].ffill();
-        df['value'] = df.groupby('sid')['value'].ffill().fillna(1.);
-        df.drop_duplicates(subset=['date','sid'], keep='first', inplace=True)
-        df.reset_index(drop=True, inplace=True);
-        df.insert(1, 'factor_name', factor)
-        df = df[['date','factor_name','sid','value']]
-        return df
-
     async def get_factor_beta(self, bq) -> pd.DataFrame:
         """
         Retrieve market beta for a list of securities over a backtest date range and map them to numeric values.
@@ -3759,7 +3729,7 @@ class BQLFactorAsync(BaseModel):
         df.rename(columns={'ID': 'sid', 'AS_OF_DATE': 'date', 'leverage': 'value'}, inplace=True)
         df.drop_duplicates(inplace=True)
         df.insert(1, 'factor_name', 'leverage')
-        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+        return pd.DataFrame(df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True))
 
     async def get_factor_profit(self, bq) -> pd.DataFrame:
         factor = bq.data.normalized_profit_margin(dates=bq.func.range(self.start_date, self.end_date))
@@ -3778,7 +3748,7 @@ class BQLFactorAsync(BaseModel):
         if 'Partial Errors' in df.columns:
             df = df.drop(columns=['Partial Errors'])
         df.dropna(inplace=True)
-        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+        return pd.DataFrame(df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True))
 
     async def get_factor_short_interest(self, bq) -> pd.DataFrame:
         dates = bq.func.range(self.start_date, self.end_date, frq='D')
@@ -3798,7 +3768,7 @@ class BQLFactorAsync(BaseModel):
         df.insert(1, 'factor_name', 'short_interest')
         if 'Partial Errors' in df.columns:
             df = df.drop(columns=['Partial Errors'])
-        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+        return pd.DataFrame(df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True))
 
     async def get_factor_earnings_yield(self, bq) -> pd.DataFrame:
         dates = bq.func.range(self.start_date, self.end_date, frq='D')
@@ -3813,9 +3783,9 @@ class BQLFactorAsync(BaseModel):
         df.drop_duplicates(inplace=True)
         df.insert(1, 'factor_name', 'earn_yield')
         df['value'] = 1. / df['value']
-        return df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True)
+        return pd.DataFrame(df[['date', 'factor_name', 'sid', 'value']].reset_index(drop=True))
 
-class YahooFactor(BaseModel):
+class YahooFactor(BaseModel, IFactor):
     """
     YahooFactor class for handling factor data using Yahoo Finance
     
@@ -3901,8 +3871,8 @@ class YahooFactor(BaseModel):
                         df['date'] = df['date'].dt.date
                     except:
                         pass # print("Yahoo factor date in date format")
-                    df.index = df['date']
-                    # df = df.set_index('date')
+                    # df.index = df['date']
+                    df = df.set_index('date', drop=False)
                     df.index.name = 'index'
             return df
             
@@ -3930,6 +3900,7 @@ class YahooFactor(BaseModel):
         
         try:
             # Download data with retries
+            data = None
             for attempt in range(3):
                 try:
                     data = yf.download(
@@ -4060,7 +4031,7 @@ class YahooFactor(BaseModel):
                     
                     # Calculate market cap for each day (price * shares)
                     for date, price in ticker_data.items():
-                        if pd.notnull(price):
+                        if pd.notnull(float(price)):
                             mkt_cap = price * shares
                             # For size factor, we use 1/log(market cap) to match BQLFactor
                             # This is because larger market cap should have smaller size factor values
@@ -4156,7 +4127,7 @@ class YahooFactor(BaseModel):
                                 pb_ratio = info['priceToBook']
                                 
                                 for date, price in ticker_data.items():
-                                    if pd.notnull(price):
+                                    if pd.notnull(float(price)):
                                         result_data.append({
                                             'date': date,
                                             'sid': ticker,
@@ -4170,7 +4141,7 @@ class YahooFactor(BaseModel):
                     else:
                         # Calculate P/B ratio for each day
                         for date, price in ticker_data.items():
-                            if pd.notnull(price) and book_value_per_share > 0:
+                            if pd.notnull(float(price)) and book_value_per_share > 0:
                                 pb_ratio = price / book_value_per_share
                                 result_data.append({
                                     'date': date,
@@ -4341,7 +4312,7 @@ class YahooFactor(BaseModel):
                     momentum = momentum[momentum.index >= pd.Timestamp(start_date_dt)]
                     
                     for date, value in momentum.items():
-                        if pd.notnull(value):
+                        if pd.notnull(float(value)):
                             result_data.append({
                                 'date': date,
                                 'sid': ticker,
@@ -4436,6 +4407,7 @@ class YahooFactor(BaseModel):
                             for date in trading_dates:
                                 # Find the most recent financial data before this date
                                 relevant_margins = margins_series[margins_series.index <= date]
+                                relevant_margins = pd.DataFrame(relevant_margins)
                                 if not relevant_margins.empty:
                                     margin = relevant_margins.iloc[-1]  # Get most recent value
                                     result_data.append({
@@ -4675,6 +4647,7 @@ class YahooFactor(BaseModel):
                     # Process earnings data
                     earnings = earnings.sort_index(ascending=False)  # Most recent first
                     eps_ttm = earnings['Earnings'].rolling(4).sum()  # Trailing 12-month EPS
+                    eps_ttm = pd.DataFrame(eps_ttm)
                     
                     # Get price data for this ticker
                     ticker_prices = data[('Adj Close', ticker)].dropna()
@@ -4753,7 +4726,7 @@ class YahooFactor(BaseModel):
                     ticker_returns = ticker_prices.pct_change().dropna()
                     
                     for date, ret in ticker_returns.items():
-                        if pd.notnull(ret):
+                        if pd.notnull(float(ret)):
                             result_data.append({
                                 'date': date,
                                 'sid': ticker,
@@ -4838,7 +4811,7 @@ class YahooFactor(BaseModel):
                     
                     # Calculate market cap for each day
                     for date, price in ticker_prices.items():
-                        if pd.notnull(price):
+                        if pd.notnull(float(price)):
                             mkt_cap = price * shares
                             result_data.append({
                                 'date': date,
@@ -4926,6 +4899,7 @@ class EquityFactor(BaseModel):
         
         def normalize_group(group_df: pd.DataFrame) -> pd.DataFrame:
             values = group_df['value'].values
+            values = np.array(values)
             
             if method == 'zscore':
                 normalized = stats.zscore(values, nan_policy='omit')
@@ -4962,8 +4936,8 @@ class EquityFactor(BaseModel):
             df = df.groupby('factor_name').apply(normalize_group, include_groups=False).reset_index(drop=True)
             df.insert(1,'factor_name',factor_name)
 
-        df.index = df.date
-        # df = df.set_index('date')
+        # df.index = df.date
+        df = df.set_index('date', drop=False)
         df.index.name = None
         return df
     
@@ -5301,7 +5275,7 @@ class EquityFactor(BaseModel):
         except ImportError:
             warnings.warn("Plotting requires matplotlib and seaborn to be installed.")
 
-def FactorFactory(factor_type: str, model_input, *args) -> BaseModel: # dates,
+def FactorFactory(factor_type: str, model_input, *args) -> IFactor: # dates,
     data_source = model_input.backtest.data_source
     start_date = str(model_input.backtest.start_date)
     end_date = str(model_input.backtest.end_date)
@@ -5347,7 +5321,8 @@ def get_rebalance_dates(
             "MON": "W-MON", "TUE": "W-TUE", "WED": "W-WED",
             "THU": "W-THU", "FRI": "W-FRI"
         }
-        freq_str = weekday_map.get(model_input.weekly_day, "W-FRI")
+        # freq_str = weekday_map.get(model_input.weekly_day, "W-FRI")
+        freq_str = "FRI"
         dates = pd.date_range(start=start, end=end, freq=freq_str)
 
     elif frq == Frequency.MONTHLY:
@@ -5787,8 +5762,8 @@ if __name__ == "__main__":
             universe=Universe.INDU,  # Universe.INDU: Dow Jones Industrial Average # 'SEMLMCUP Index', 'NDX Index'
             currency=Currency.USD,
             frq=Frequency.MONTHLY,
-            start='2023-12-31', # '2023-12-31',
-            # end='2024-12-02' # If not end date, default to today
+            start=pd.to_datetime('2023-12-31').date(), # # start='2023-12-31',
+            # end=pd.to_datetime('2024-12-31').date() # If not end date, default to today
             portfolio_list=[],
             concurrent_download = True
         ),
@@ -5836,12 +5811,11 @@ if __name__ == "__main__":
     """
     # Create Yahoo Finance SecurityMaster
     config_yahoo = SecurityMasterConfig(
-        source = model_input.backtest.data_source, # DataSource.YAHOO,
-        universe = get_universe_mapping_yahoo(model_input.backtest.universe), # "^SPX",
-        dates = model_input.backtest.dates_daily,
-        dates_turnover = model_input.backtest.dates_turnover
+        source=model_input.backtest.data_source,  # DataSource.YAHOO,
+        universe=get_universe_mapping_yahoo(model_input.backtest.universe),  # "^SPX",
+        dates=list(model_input.backtest.dates_daily) if model_input.backtest.dates_daily else [],
+        dates_turnover=list(model_input.backtest.dates_turnover) if model_input.backtest.dates_turnover else []
     )
-    
     # Create instance using factory
     security_master = SecurityMasterFactory.create(config_yahoo)
     
@@ -5861,7 +5835,7 @@ if __name__ == "__main__":
         df_benchmark_prices = security_master.get_benchmark_prices()
     else:
         df_benchmark_prices = mgr.load_prices(identifier)
-        security_master.df_bench = df_benchmark_prices
+        security_master.df_bench = df_benchmark_prices  # type: ignore[attr-defined]
     print("\nSecurity Master Benchmark Prices:")
     print(df_benchmark_prices.tail(3))
 
@@ -5870,7 +5844,7 @@ if __name__ == "__main__":
         df_benchmark_weights = security_master.get_benchmark_weights()
     else:
         df_benchmark_weights = mgr.load_benchmark_weights(identifier)
-        security_master.weights_data = df_benchmark_weights
+        security_master.weights_data = df_benchmark_weights  # type: ignore[attr-defined]
         # Ensure 'weight' column exists (backward compatibility: convert 'wgt' to 'weight' if needed)
         if 'wgt' in df_benchmark_weights.columns and 'weight' not in df_benchmark_weights.columns:
             df_benchmark_weights['weight'] = df_benchmark_weights['wgt']
@@ -5973,6 +5947,8 @@ if __name__ == "__main__":
                 factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
                 factor_df = factor_df[['date','factor_name','sid','value']]
 
+            factor_df = pd.DataFrame(factor_df)
+
             # Create EquityFactor instance
             factor_eq = EquityFactor(
                 name=factor_type,
@@ -6047,8 +6023,10 @@ if __name__ == "__main__":
             factor_df = factor_data_dict.get(factor_type)
 
             if df_benchmark_weights.shape[0]>0:
-                factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, factor_df)
+                factor_df = merge_weights_with_factor_loadings(df_benchmark_weights, pd.DataFrame(factor_df))
                 factor_df = factor_df[['date','factor_name','sid','value']]
+
+            factor_df = pd.DataFrame(factor_df)
 
             # Create EquityFactor instance
             factor_eq = EquityFactor(
@@ -6097,7 +6075,6 @@ if __name__ == "__main__":
                 df_exposures = df_exposures.merge(df, how='left', on=['date','sid'])
 
         df_exposures.dropna(inplace=True)
-        # df_exposures.index = df_exposures['date']
         df_exposures.index = df_exposures.date
         df_exposures.index.name = None
 
@@ -6130,22 +6107,6 @@ if __name__ == "__main__":
 
     for factor in factor_list: # ['beta']
         
-        # Create optimization constraints
-        # constraints = PurePortfolioConstraints(
-        #     long_only=False,
-        #     full_investment=True,
-        #     factor_neutral=[i for i in factor_list if i!=factor],
-        #     weight_bounds=(-0.05, 0.05),
-        #     min_holding=0.01
-        # )
-
-        # # Initialize optimizer
-        # optimizer_pure = PureFactorOptimizer(
-        #     target_factor=factor,
-        #     constraints=constraints,
-        #     normalize_weights=True,
-        #     parallel_processing=False
-        # )
         constraints = PurePortfolioConstraints(
             long_only=False,
             full_investment=False,
