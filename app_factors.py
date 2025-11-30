@@ -1775,7 +1775,7 @@ with st.sidebar:
         # These are the specific, stable model IDs that work with the APIs
         model_options = {
             "gemini": [
-                "gemini-1.5-flash-002", # Fast, cost-effective (Recommended)
+                "gemini-2.5-flash", # Fast, cost-effective (Recommended)
                 "gemini-1.5-pro-002",   # High reasoning
                 "gemini-1.5-flash",     # Older stable
                 "gemini-1.5-pro",

@@ -27,7 +27,7 @@ class AIAnalyst:
                 from google import genai
                 # Use a specific, stable model version to avoid 404 errors
                 # gemini-1.5-flash-002 is the updated stable flash model
-                self.model = self.model or "gemini-1.5-flash-002" 
+                self.model = self.model or "gemini-2.5-flash" 
                 return genai.Client(api_key=self.api_key)
             
             elif self.provider == "anthropic":
@@ -109,7 +109,8 @@ class AIAnalyst:
     def _call_gemini(self, sys_prompt, user_prompt):
         try:
             response = self.client.models.generate_content(
-                model=self.model,
+                # model=self.model,
+                model='gemini-2.5-flash',
                 contents=user_prompt,
                 config={
                     'system_instruction': sys_prompt,
