@@ -48,6 +48,7 @@ from qOptimization import (
 from portfolio_analysis import (
     render_portfolio_upload_section, run_user_portfolio_analysis, render_portfolio_analysis_results)
 from report_generator import AppReportBuilder
+from ai_analyst import AIAnalyst  # <--- NEW IMPORT
 
 
 # S3 bucket and folder configuration
@@ -1750,6 +1751,106 @@ if 'te_factor_constraints' not in st.session_state:
 with st.sidebar:
     st.header("Configuration")
 
+    # ... inside st.sidebar ...
+    st.divider()
+    with st.expander("🤖 AI Analyst Settings", expanded=True):
+        # 1. Provider Selection
+        ai_provider = st.selectbox(
+            "AI Provider", 
+            options=["Gemini (Google)", "Anthropic", "OpenAI"],
+            index=0, 
+            help="Select the backend AI provider."
+        )
+        
+        # Map friendly names to internal IDs and set API key label
+        provider_map = {
+            "Gemini (Google)": "gemini",
+            "Anthropic": "anthropic",
+            "OpenAI": "openai"
+        }
+        selected_provider_id = provider_map[ai_provider]
+        api_key_label = f"{ai_provider.split(' ')[0]} API Key"
+        
+        # 2. Curated Model Lists (Updated Nov 2025)
+        # These are the specific, stable model IDs that work with the APIs
+        model_options = {
+            "gemini": [
+                "gemini-1.5-flash-002", # Fast, cost-effective (Recommended)
+                "gemini-1.5-pro-002",   # High reasoning
+                "gemini-1.5-flash",     # Older stable
+                "gemini-1.5-pro",
+            ],
+            "anthropic": [
+                "claude-3-5-sonnet-latest", # Best balance (Recommended)
+                "claude-3-5-haiku-latest",  # Fast
+                "claude-3-opus-latest",     # Max reasoning
+                "claude-3-5-sonnet-20241022" # Specific version
+            ],
+            "openai": [
+                "gpt-4o",        # Flagship (Recommended)
+                "gpt-4o-mini",   # Fast/Cheap
+                "gpt-4-turbo",
+                "o1-preview",    # Advanced reasoning
+                "o1-mini"
+            ]
+        }
+        
+        # 3. Model Dropdown with "Custom" option
+        current_models = model_options[selected_provider_id]
+        selected_model_option = st.selectbox(
+            "Model", 
+            options=current_models + ["Other / Custom..."],
+            index=0, # Default to the first (recommended) model
+            help="Select a specific model version."
+        )
+        
+        # 4. Handle Custom Model Entry
+        if selected_model_option == "Other / Custom...":
+            final_model_name = st.text_input(
+                "Enter Custom Model ID", 
+                placeholder="e.g., gemini-2.0-flash-exp",
+                help="Check provider documentation for new model IDs."
+            )
+        else:
+            final_model_name = selected_model_option
+
+        # 5. API Key Input
+        ai_api_key = st.text_input(api_key_label, type="password")
+        
+        if not ai_api_key:
+            st.caption(f"Enter {ai_provider} Key to enable.")
+
+    # st.divider()
+    # with st.expander("🤖 AI Analyst Settings", expanded=True):
+    #     ai_provider = st.selectbox(
+    #         "AI Provider", 
+    #         options=["Gemini (Google)", "Anthropic", "OpenAI"],
+    #         index=0, # Defaults to Gemini
+    #         help="Select the AI model provider for generating insights."
+    #     )
+        
+    #     # Map friendly names to internal IDs
+    #     provider_map = {
+    #         "Gemini (Google)": "gemini",
+    #         "Anthropic": "anthropic",
+    #         "OpenAI": "openai"
+    #     }
+    #     selected_provider_id = provider_map[ai_provider]
+        
+        # # Dynamic label for API Key
+        # api_key_label = f"{ai_provider.split(' ')[0]} API Key"
+        # ai_api_key = st.text_input(api_key_label, type="password")
+        
+        # # Optional: Model override
+        # ai_model_override = st.text_input(
+        #     "Model Name (Optional)", 
+        #     placeholder="e.g., gemini-2.0-flash",
+        #     help="Leave empty to use the default model for this provider."
+        # )
+        
+        # if not ai_api_key:
+        #     st.caption(f"Enter {ai_provider} Key to enable.")
+
     # Data Management Section
     st.subheader("Data Management")
     
@@ -2089,6 +2190,54 @@ with tab1:
                 st.subheader("Turnover Analysis")
                 st.dataframe(factor_results['turnover'])
             
+            # --- NEW AI INTEGRATION START ---
+            st.divider()
+            st.subheader(f"🤖 AI Analyst Insight: {selected_factor}")
+            
+            # Check if key is provided for the SELECTED provider
+            if ai_api_key:
+                # Use final_model_name from the sidebar
+                if st.button(f"Generate Insight with {ai_provider}", type="secondary"):
+                    with st.spinner(f"Consulting {final_model_name}..."):
+                        
+                        analyst = AIAnalyst(
+                            api_key=ai_api_key, 
+                            provider=selected_provider_id,
+                            model=final_model_name  # <--- Updated to use the dropdown selection
+                        )
+                # if st.button(f"Generate Insight with {ai_provider}", type="secondary"):
+                #     with st.spinner(f"Consulting {ai_provider} about {selected_factor}..."):
+                        
+                #         # 1. Initialize Analyst with selected provider
+                #         # Note: We pass the specific model if provided, else None (uses default)
+                #         analyst = AIAnalyst(
+                #             api_key=ai_api_key, 
+                #             provider=selected_provider_id,
+                #             model=ai_model_override if ai_model_override else None
+                #         )
+                        
+                        # 2. Prepare Data (Same as before)
+                        stats_df = factor_results['portfolio_stats']
+                        turnover_df = factor_results['turnover'].to_frame(name="Turnover")
+                        
+                        corr_df = None
+                        if st.session_state.pure_factor_returns is not None:
+                             corr_df = st.session_state.pure_factor_returns.corr()
+
+                        # 3. Get Analysis
+                        insight = analyst.analyze_factor(
+                            factor_name=selected_factor,
+                            stats_df=stats_df,
+                            turnover_df=turnover_df,
+                            correlation_df=corr_df
+                        )
+                        
+                        # 4. Display
+                        st.markdown(insight)
+            else:
+                st.warning(f"⚠️ Please enter your {ai_provider} API Key in the sidebar to enable analysis.")
+            # --- NEW AI INTEGRATION END ---
+
             # Factor autocorrelation
             st.subheader("Factor Autocorrelation")
             # Calculate autocorrelation for each security's factor exposure

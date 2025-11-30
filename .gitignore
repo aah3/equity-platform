@@ -74,3 +74,4 @@ src/test_postgres.py
 src/index_report_template.py
 financial_dashboard.pdf
 src/test_opt.py
+app.log
