@@ -55,6 +55,126 @@ from ai_analyst import AIAnalyst  # <--- NEW IMPORT
 S3_BUCKET = os.getenv('S3_BUCKET', 'your-bucket-name')
 S3_PREFIX = 'time_series/'
 
+
+def get_app_context(prompt: str, data_format: str = "csv") -> str:
+    """
+    Scans the user prompt for keywords and retrieves relevant data 
+    from Streamlit session state to inject into the AI context.
+    
+    Args:
+        prompt (str): The user's query.
+        data_format (str): Format for data tables ('csv', 'json', 'markdown'). 
+                           'csv' is recommended for token efficiency.
+    """
+    context_parts = []
+    prompt_lower = prompt.lower()
+
+    # Helper to format DataFrame based on selection
+    def format_df(df, float_format="%.4f"):
+        if df.empty:
+            return "No data available."
+            
+        if data_format == "json":
+            # JSON is verbose but structured
+            return df.to_json(orient="index", date_format="iso")
+        elif data_format == "csv":
+            # CSV is token-efficient and LLMs read it well
+            return df.to_csv(index=True)
+        else:
+            # Markdown is human-readable (good for debugging)
+            # Fixed the typo here: changed ".2%}" to ".2%"
+            fmt = ".2%" if "percent" in float_format or "%" in float_format else ".2f"
+            return df.to_markdown(floatfmt=fmt)
+
+    # --- Case A: Pure Factor Portfolios ---
+    if "pure" in prompt_lower or "factor portfolio" in prompt_lower:
+        if 'pure_factor_returns' in st.session_state and st.session_state.pure_factor_returns is not None:
+            df_ret = st.session_state.pure_factor_returns
+            
+            # Create summaries
+            summary_stats = df_ret.describe()
+            recent_perf = df_ret.tail(5)
+            
+            context_parts.append(f"### DATA CONTEXT: PURE FACTOR PORTFOLIOS ({data_format.upper()})\n")
+            context_parts.append(f"**Recent Performance (Last 5 Periods):**\n{format_df(recent_perf, '%.2%')}\n")
+            context_parts.append(f"**Summary Statistics:**\n{format_df(summary_stats)}\n")
+            
+            # Correlations
+            corr_matrix = df_ret.corr()
+            context_parts.append(f"**Factor Correlations:**\n{format_df(corr_matrix)}\n")
+        else:
+            context_parts.append("Note: User asked about Pure Portfolios, but no data was found in session state.")
+
+    # --- Case B: Tracking Error / Optimization Results ---
+    if "optimization" in prompt_lower or "tracking error" in prompt_lower or "te" in prompt_lower:
+        if 'te_optimization_results' in st.session_state and st.session_state.te_optimization_results is not None:
+            te_results = st.session_state.te_optimization_results
+            meta = te_results.get('meta_data')
+            
+            if meta is not None:
+                # Calculate scalar metrics
+                avg_te = meta['tracking_error'].mean()
+                success_rate = (meta['status'] == 'success').mean()
+                
+                context_parts.append(f"### DATA CONTEXT: TRACKING ERROR OPTIMIZATION\n")
+                context_parts.append(f"- Average Tracking Error: {avg_te:.2%}")
+                context_parts.append(f"- Optimization Success Rate: {success_rate:.1%}")
+                context_parts.append(f"- Total Rebalance Periods: {len(meta)}\n")
+                
+                # Add recent optimization details
+                recent_meta = meta.tail(3)
+                context_parts.append(f"**Recent Rebalance Details:**\n{format_df(recent_meta)}")
+
+    # --- Case C: User Uploaded Portfolio ---
+    if "my portfolio" in prompt_lower or "uploaded" in prompt_lower:
+        if 'user_portfolio_analysis' in st.session_state and st.session_state.user_portfolio_analysis is not None:
+            analysis = st.session_state.user_portfolio_analysis
+            stats = analysis.get('stats', pd.DataFrame())
+            
+            context_parts.append(f"### DATA CONTEXT: USER UPLOADED PORTFOLIO\n")
+            context_parts.append(f"**Portfolio Stats:**\n{format_df(stats)}\n")
+
+    return "\n\n".join(context_parts)
+
+
+def get_stock_context(ticker: str) -> str:
+    """
+    Retrieves summary stats and factor exposures for a specific ticker 
+    from the session state data.
+    """
+    if 'df_ret_long' not in st.session_state or st.session_state.df_ret_long is None:
+        return ""
+    
+    # 1. Get Returns Stats
+    df = st.session_state.df_ret_long
+    stock_data = df[df['sid'] == ticker]
+    
+    if stock_data.empty:
+        return ""
+        
+    # Calculate simple stats
+    ann_ret = stock_data['return'].mean() * 252
+    ann_vol = stock_data['return'].std() * (252**0.5)
+    sharpe = ann_ret / ann_vol if ann_vol != 0 else 0
+    
+    context = f"**{ticker} Performance Summary:**\n"
+    context += f"- Annualized Return: {ann_ret:.1%}\n"
+    context += f"- Annualized Volatility: {ann_vol:.1%}\n"
+    context += f"- Sharpe Ratio: {sharpe:.2f}\n\n"
+    
+    # 2. Get Factor Exposures (Latest)
+    context += f"**{ticker} Factor Exposures (Latest):**\n"
+    if 'factor_data' in st.session_state and st.session_state.factor_data:
+        for factor_name, factor_df in st.session_state.factor_data.items():
+            # Filter for ticker and get latest date
+            f_data = factor_df[factor_df['sid'] == ticker]
+            if not f_data.empty:
+                latest_val = f_data.sort_values('date').iloc[-1]['value']
+                context += f"- {factor_name}: {latest_val:.3f}\n"
+                
+    return context
+
+
 def prepare_portfolio_download_data(portfolio_data: pd.DataFrame, data_type: str = "portfolio") -> pd.DataFrame:
     """
     Prepare portfolio data for download by cleaning and formatting.
@@ -2130,7 +2250,7 @@ elif st.session_state.config_changed:
     run_data_update()
 
 # Main tabs
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9= st.tabs([
     "Factor Analysis",
     "Portfolio Optimization", 
     "Pure Portfolios",
@@ -2138,7 +2258,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Risk Analysis",
     "Portfolio Upload & Analysis",
     "Report",
-    "Documentation"
+    "🤖 AI Assistant",
+    "Documentation",
 ])
 
 # Factor Analysis Tab
@@ -3155,8 +3276,82 @@ with tab7:
         except Exception as e:
             st.error(f"Failed to generate report: {e}")
 
-# Documentation Tab
+# AI Assistant Tab
 with tab8:
+    st.header("🤖 AI Research Assistant")
+    st.markdown("Ask questions about specific stocks in your universe, factor definitions, or portfolio strategy.")
+
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # React to user input
+    if prompt := st.chat_input("Ask about a stock (e.g., 'How is IBM performing?') or a factor..."):
+        
+        # 1. Check for API Key
+        if not ai_api_key:
+            st.error(f"Please enter your {ai_provider} API Key in the sidebar to chat.")
+            st.stop()
+
+        # 2. Display user message
+        st.chat_message("user").write(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        # 3. Build Context (Smart Data Fetching)
+        # Check if any universe ticker is mentioned in the prompt
+        # context_str = ""
+        # if st.session_state.model_input and st.session_state.model_input.backtest.universe_list:
+        #     universe = st.session_state.model_input.backtest.universe_list
+        #     # Simple check: is a ticker symbol present in the prompt? (Case sensitive or upper)
+        #     found_tickers = [t for t in universe if t in prompt.upper().split()]
+            
+        #     if found_tickers:
+        #         for ticker in found_tickers:
+        #             context_str += get_stock_context(ticker)
+        #         st.toast(f"Found data for: {', '.join(found_tickers)}", icon="📊")
+        # ... inside Tab 9 ...
+        context_str = ""
+        
+        # A. Check for specific Stocks (Existing Logic)
+        if st.session_state.model_input and st.session_state.model_input.backtest.universe_list:
+            universe = st.session_state.model_input.backtest.universe_list
+            found_tickers = [t for t in universe if t in prompt.upper().split()]
+            if found_tickers:
+                for ticker in found_tickers:
+                    context_str += get_stock_context(ticker)
+                st.toast(f"Found stock data for: {', '.join(found_tickers)}", icon="📈")
+
+        # B. Check for App Data (NEW LOGIC)
+        # Updated to use CSV format for token efficiency and robust parsing
+        app_context = get_app_context(prompt, data_format="csv") 
+        
+        if app_context:
+            context_str += "\n\n" + app_context
+            st.toast("Loaded app data context", icon="💾")
+
+        # 4. Generate Response
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing..."):
+                # Initialize analyst
+                analyst = AIAnalyst(
+                    api_key=ai_api_key, 
+                    provider=selected_provider_id,
+                    model=final_model_name
+                )
+                
+                response = analyst.chat(st.session_state.messages, context_data=context_str)
+                st.markdown(response)
+                
+        # 5. Save assistant response
+        st.session_state.messages.append({"role": "assistant", "content": response})
+
+# Documentation Tab
+with tab9:
     st.header("Documentation")
     
     st.markdown("""

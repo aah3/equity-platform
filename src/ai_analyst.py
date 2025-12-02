@@ -106,7 +106,62 @@ class AIAnalyst:
         except Exception as e:
             return self._format_error(e)
 
-    def _call_gemini(self, sys_prompt, user_prompt):
+    def chat(self, messages: list, context_data: str = "", temperature: float = 0.3) -> str:
+        """
+        Handles interactive chat with data context injection.
+        """
+        if not self.client:
+            return "⚠️ Please enter your API Key in the sidebar."
+
+        # System prompt that defines the persona
+        base_system_prompt = (
+            "You are a sophisticated Financial Research Assistant integrated into a Factor Analysis Platform. "
+            "Your goal is to answer user questions about stocks, factors, and portfolio risk. "
+            "If data is provided in the context, use it to give precise, quantitative answers. "
+            "If the user asks for investment advice, politely decline but offer objective data analysis instead. "
+            "Keep answers concise and professional."
+        )
+
+        # Inject dynamic context (e.g., "IBM Data: Return 5%, Vol 10%...") if available
+        if context_data:
+            base_system_prompt += f"\n\n### CURRENT DATA CONTEXT:\n{context_data}"
+
+        try:
+            # 1. Google Gemini
+            if self.provider == "gemini":
+                # Convert standard messages format to Gemini format if needed, 
+                # or just use the last message with context for simple Q&A
+                last_msg = messages[-1]['content']
+                return self._call_gemini(base_system_prompt, last_msg, temperature=0.3)
+
+            # 2. Anthropic
+            elif self.provider == "anthropic":
+                # Anthropic expects 'system' separate from messages
+                # Convert session state messages to Anthropic format
+                anthro_msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
+                message = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1000,
+                    system=base_system_prompt,
+                    messages=anthro_msgs
+                )
+                return message.content[0].text
+
+            # 3. OpenAI
+            elif self.provider == "openai":
+                # Prepend system prompt to history
+                full_history = [{"role": "system", "content": base_system_prompt}] + messages
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=full_history,
+                    temperature=0.3
+                )
+                return response.choices[0].message.content
+
+        except Exception as e:
+            return self._format_error(e)
+
+    def _call_gemini(self, sys_prompt, user_prompt, temperature: float = 0.3):
         try:
             response = self.client.models.generate_content(
                 # model=self.model,
@@ -114,7 +169,7 @@ class AIAnalyst:
                 contents=user_prompt,
                 config={
                     'system_instruction': sys_prompt,
-                    'temperature': 0.3
+                    'temperature': temperature
                 }
             )
             return response.text
